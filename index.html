@@ -1,0 +1,1749 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>APAC 2026 Planning Dashboard</title>
+    <!-- Tailwind CSS for styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- PapaParse for CSV processing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/PapaParse/5.3.0/papaparse.min.js"></script>
+    <!-- Marked.js for robust Markdown rendering -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- PDF.js for PDF Text Extraction -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <!-- LocalForage for Offline Storage (IndexedDB wrapper) -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/localforage/1.10.0/localforage.min.js"></script>
+
+    <!-- Firebase SDKs -->
+    <script type="module">
+       import { initializeApp } from "firebase/app";
+import { getAnalytics } from "firebase/analytics";
+
+        // Global variable to hold DB instance for non-module script access
+        window.firebaseDB = null;
+        window.firebaseAuth = null;
+        window.firebaseStorage = null;
+        window.repoCollectionRef = null;
+        window.appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+
+        const firebaseConfig = {
+  apiKey: "AIzaSyAqUFv2ECSUjYdcUbxTHL3ciPt4d1AW9FI",
+  authDomain: "apac-shorts.firebaseapp.com",
+  projectId: "apac-shorts",
+  storageBucket: "apac-shorts.firebasestorage.app",
+  messagingSenderId: "119416626919",
+  appId: "1:119416626919:web:865aaa1f198d44da864c42",
+  measurementId: "G-W636G302N1"
+};
+
+        if (firebaseConfig) {
+            try {
+                const app = initializeApp(firebaseConfig);
+                  const analytics = getAnalytics(app);
+                window.firebaseAuth = getAuth(app);
+                window.firebaseDB = getFirestore(app);
+                window.firebaseStorage = getStorage(app);
+                
+                // Auth Flow
+                const initAuth = async () => {
+                    try {
+                        if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                            await signInWithCustomToken(window.firebaseAuth, __initial_auth_token);
+                            console.log("Signed in with Custom Token");
+                        } else {
+                             await signInAnonymously(window.firebaseAuth);
+                             console.log("Signed in anonymously (Fallback)");
+                        }
+                    } catch (authError) {
+                        console.warn("Auth failed, retrying anonymous:", authError);
+                        try {
+                            await signInAnonymously(window.firebaseAuth);
+                        } catch(e) {
+                             console.error("Anonymous Auth Failed:", e);
+                             const status = document.getElementById('cloud-status');
+                             if(status) {
+                                status.innerText = 'Auth Failed';
+                                status.className = 'text-sm font-mono text-red-500 bg-white px-3 py-1 rounded border border-red-200';
+                             }
+                        }
+                    }
+                };
+                
+                initAuth();
+
+                onAuthStateChanged(window.firebaseAuth, (user) => {
+                    if (user) {
+                        console.log("User authenticated:", user.uid);
+                        // PUBLIC PATH: /artifacts/{appId}/public/data/{collectionName}
+                        window.repoCollectionRef = collection(window.firebaseDB, 'artifacts', window.appId, 'public', 'data', 'repository');
+                        
+                        // Start Listener
+                        initRepoListener();
+                        
+                        const statusEl = document.getElementById('cloud-status');
+                        if(statusEl) {
+                            statusEl.innerHTML = '<span class="text-green-600 flex items-center gap-1"><span class="w-2 h-2 rounded-full bg-green-500"></span> Cloud Connected</span>';
+                            statusEl.className = 'text-sm font-mono text-green-700 bg-green-50 px-3 py-1 rounded border border-green-200';
+                        }
+                    }
+                });
+            } catch (e) {
+                console.error("Firebase Initialization Error:", e);
+                const status = document.getElementById('cloud-status');
+                if(status) status.innerText = 'Cloud Init Error';
+            }
+        } else {
+             const status = document.getElementById('cloud-status');
+             if(status) status.innerText = 'Local Mode';
+        }
+
+        function initRepoListener() {
+            if (!window.repoCollectionRef) return;
+            
+            onSnapshot(window.repoCollectionRef, (snapshot) => {
+                const repoData = {
+                    'repo_campaign': [],
+                    'repo_holdback': [],
+                    'repo_kpop': []
+                };
+
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    if (data.category && repoData[data.category]) {
+                        repoData[data.category].push({
+                            id: doc.id,
+                            name: data.name,
+                            content: data.content, // Fallback content
+                            storageUrl: data.storageUrl, // Firebase Storage URL
+                            type: data.type,
+                            date: data.date
+                        });
+                    }
+                });
+                
+                if (window.updateRepoCacheFromCloud) {
+                    window.updateRepoCacheFromCloud(repoData);
+                }
+            }, (error) => {
+                console.error("Firestore Listen Error:", error);
+                const statusEl = document.getElementById('cloud-status');
+                if (statusEl) {
+                    statusEl.innerText = 'Sync Error';
+                    statusEl.className = 'text-sm font-mono text-red-500 bg-white px-3 py-1 rounded border border-red-200';
+                    statusEl.title = error.message;
+                }
+            });
+        }
+
+        // Save to Cloud (Hybrid: Storage Bucket + Firestore)
+        window.saveToCloud = async (fileObj, category) => {
+            if (!window.repoCollectionRef) {
+                console.warn("Firestore not ready.");
+                return false;
+            }
+
+            const docId = `${category}_${fileObj.name.replace(/[^a-z0-9]/gi, '_')}`;
+            const docRef = doc(window.repoCollectionRef, docId);
+            
+            let downloadURL = null;
+            let contentToSave = fileObj.content; // Default to saving in Firestore if Storage fails
+
+            // 1. Try Firebase Storage (for permanence/size)
+            if (window.firebaseStorage) {
+                try {
+                    // Use a simpler path for storage to avoid deep nesting issues if buckets are restrictive
+                    const storageRef = ref(window.firebaseStorage, `repository/${window.appId}/${docId}`);
+                    await uploadString(storageRef, fileObj.content);
+                    downloadURL = await getDownloadURL(storageRef);
+                    contentToSave = null; // Don't duplicate data in Firestore if Storage worked
+                } catch (storageError) {
+                    console.warn("Firebase Storage upload failed (likely CORS or Permissions). Falling back to Firestore-only storage.", storageError);
+                    // Fallback: Check size for Firestore limit
+                    if (fileObj.content.length > 900000) {
+                         alert(`File "${fileObj.name}" is too large for the database fallback (~1MB limit) and Cloud Storage failed. It cannot be saved.`);
+                         return false;
+                    }
+                    contentToSave = fileObj.content;
+                }
+            } else if (fileObj.content.length > 900000) {
+                 alert(`File "${fileObj.name}" is too large for database storage (~1MB limit).`);
+                 return false;
+            }
+
+            // 2. Save Metadata to Firestore
+            try {
+                await setDoc(docRef, {
+                    name: fileObj.name,
+                    content: contentToSave, // Null if Storage worked, String if fallback
+                    storageUrl: downloadURL,
+                    type: fileObj.type,
+                    category: category,
+                    date: new Date().toLocaleDateString()
+                });
+                return true;
+            } catch (e) {
+                console.error("Firestore Save Error:", e);
+                alert("Failed to save to cloud database. Permissions may be restricted.");
+                return false;
+            }
+        };
+
+        window.deleteFromCloud = async (docId, storageUrl) => {
+             if (!window.repoCollectionRef) return;
+             try {
+                 // Delete Firestore Record
+                 await deleteDoc(doc(window.repoCollectionRef, docId));
+             } catch (e) {
+                 console.error("Delete failed:", e);
+                 alert("Failed to delete. You might not have permission.");
+             }
+        };
+
+        // Helper to fetch content if it's in Storage
+        window.fetchContentFromUrl = async (url) => {
+            try {
+                const response = await fetch(url);
+                if (!response.ok) throw new Error("Network response was not ok");
+                return await response.text();
+            } catch (error) {
+                console.error("Failed to fetch file content from URL:", error);
+                throw error;
+            }
+        };
+
+    </script>
+    <script>
+        // Set worker script for PDF.js to match library version
+        if (typeof pdfjsLib !== 'undefined') {
+            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+        }
+    </script>
+    <style>
+        /* General Tab Styling */
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .tab-btn.active { border-bottom: 2px solid #2563eb; color: #2563eb; font-weight: 600; }
+        
+        /* Sub-Tab Styling (Regional) - Fixed Active State */
+        .sub-tab-content { display: none; }
+        .sub-tab-content.active { display: block; }
+        .sub-tab-btn { color: #6b7280; border-bottom: 2px solid transparent; }
+        .sub-tab-btn:hover { color: #374151; border-bottom: 2px solid #d1d5db; }
+        .sub-tab-btn.active { color: #2563eb !important; border-bottom: 2px solid #2563eb !important; font-weight: 600; }
+        
+        /* Repository Tab Styling */
+        .repo-tab-content { display: none; }
+        .repo-tab-content.active { display: block; }
+        .repo-tab-btn.active { background-color: #eff6ff; color: #1d4ed8; border-color: #bfdbfe; font-weight: 600; }
+
+        /* Custom Table and Scrollbar Styles for Data Summary */
+        .table-container {
+            overflow-x: auto; 
+            position: relative;
+            border: 1px solid #e5e7eb;
+            border-radius: 0.5rem;
+            background-color: white;
+            max-height: 75vh;
+            overflow-y: auto;
+        }
+        
+        .table-container::-webkit-scrollbar {
+            height: 12px;
+            width: 12px;
+        }
+        .table-container::-webkit-scrollbar-thumb {
+            background-color: #cbd5e1;
+            border-radius: 6px;
+            border: 3px solid white;
+        }
+        .table-container::-webkit-scrollbar-track {
+            background-color: #f1f5f9;
+        }
+        
+        /* Table Styling (General Data Tables) */
+        table {
+            border-collapse: separate;
+            border-spacing: 0;
+            width: 100%;
+        }
+
+        th, td {
+            border-bottom: 1px solid #e5e7eb;
+            padding: 0.75rem 1rem;
+            white-space: nowrap; /* Keep data tables single line */
+            font-size: 0.875rem;
+        }
+
+        /* Sticky Columns with Shadows */
+        .sticky-col {
+            position: sticky;
+            left: 0;
+            background-color: white;
+            z-index: 10;
+        }
+        
+        /* Add a shadow to the right of the sticky group to create depth */
+        th.sticky-col:last-child,
+        td.sticky-col:last-child {
+            box-shadow: 4px 0 6px -2px rgba(0, 0, 0, 0.05);
+            border-right: 1px solid #e5e7eb;
+        }
+
+        /* Header Styling */
+        .table-container thead {
+            position: sticky;
+            top: 0;
+            z-index: 30;
+            background-color: #f8fafc; /* Slate-50 */
+        }
+        
+        .table-container thead th {
+            font-weight: 600 !important;
+            color: #475569; /* Slate-600 */
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            background-color: #f8fafc;
+        }
+        
+        /* Ensure sticky headers sit above sticky columns */
+        .table-container thead th.sticky-col {
+            z-index: 40;
+            background-color: #f8fafc;
+        }
+
+        /* Row Hover */
+        tbody tr:hover td {
+            background-color: #f8fafc;
+        }
+        
+        /* Sticky col background fix on hover */
+        tbody tr:hover td.sticky-col {
+            background-color: #f8fafc;
+        }
+
+        /* Significance Colors (Standard Tables) */
+        .color-sig-pos { color: #10B981; font-weight: 700; background-color: #ecfdf5 !important; }
+        .color-sig-neg { color: #EF4444; font-weight: 700; background-color: #fef2f2 !important; }
+        .color-sig-neutral { color: #334155; }
+        .color-na { color: #94a3b8; font-style: italic; font-size: 0.8em;}
+        
+        /* Markdown Styling (Learnings & Year Ahead) */
+        .markdown-content { line-height: 1.7; color: #334155; max-width: 100%; }
+        .markdown-content h1 { font-size: 2rem; font-weight: 800; margin-bottom: 1.5rem; margin-top: 2rem; color: #1e3a8a; border-bottom: 2px solid #bfdbfe; padding-bottom: 0.5rem; }
+        .markdown-content h2 { font-size: 1.5rem; font-weight: 700; margin-top: 2rem; margin-bottom: 1rem; color: #1e293b; border-left: 4px solid #2563eb; padding-left: 1rem; padding-top: 0.5rem; padding-bottom: 0.5rem; background: #f8fafc; }
+        .markdown-content h3 { font-size: 1.25rem; font-weight: 600; margin-top: 1.5rem; margin-bottom: 0.75rem; color: #1e40af; border-bottom: 2px solid #e0e7ff; padding-bottom: 0.5rem; }
+        .markdown-content h4 { font-size: 1.1rem; font-weight: 600; margin-top: 1.25rem; color: #4b5563; }
+        .markdown-content p { margin-bottom: 1rem; }
+        .markdown-content ul { list-style-type: disc; padding-left: 1.5rem; margin-bottom: 1.25rem; }
+        .markdown-content li { margin-bottom: 0.5rem; }
+        .markdown-content strong { color: #0f172a; font-weight: 700; }
+        
+        /* Custom Styles for Sig Highlighting in Markdown - TEXT ONLY (No Background) */
+        .sig-green { color: #16a34a; font-weight: 700; }
+        .sig-red { color: #dc2626; font-weight: 700; }
+        
+        /* Specific Table Styling for Markdown Content */
+        .markdown-content table { 
+            width: 100%; 
+            border-collapse: collapse; 
+            margin-bottom: 2rem; 
+            font-size: 0.85rem; 
+            border: 1px solid #cbd5e1;
+            table-layout: auto; 
+        }
+        
+        .markdown-content th, .markdown-content td { 
+            border: 1px solid #cbd5e1; 
+            padding: 0.75rem; 
+            text-align: left; 
+            vertical-align: top;
+            white-space: normal; 
+            word-wrap: break-word; 
+        }
+        
+        .markdown-content th { 
+            background-color: #f1f5f9; 
+            font-weight: 700; 
+            color: #0f172a; 
+            text-transform: uppercase;
+            font-size: 0.75rem;
+            letter-spacing: 0.05em;
+            border-bottom: 2px solid #94a3b8;
+        }
+        
+        .markdown-content tr:nth-child(even) { background-color: #f8fafc; }
+
+        /* Loading Overlay */
+        #loading-overlay {
+            position: fixed; top:0; left:0; width:100%; height:100%;
+            background: rgba(255,255,255,0.95); z-index: 100;
+            display: flex; justify-content: center; align-items: center;
+            flex-direction: column;
+        }
+        
+        /* Animations */
+        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+        .fade-in { animation: fadeIn 0.3s ease-in-out; }
+    </style>
+</head>
+<body class="bg-gray-100 min-h-screen text-gray-800 font-sans">
+
+    <!-- Loading Overlay -->
+    <div id="loading-overlay">
+        <div class="animate-spin rounded-full h-16 w-16 border-b-4 border-blue-600 mb-6"></div>
+        <h2 class="text-xl font-bold text-gray-800 mb-2">APAC Dashboard 2026</h2>
+        <p id="loading-text" class="text-gray-500 font-medium">Connecting to Cloud Repository...</p>
+    </div>
+
+    <div class="w-full max-w-7xl mx-auto p-4 md:p-8">
+        <header class="mb-8 flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
+            <div>
+                <h1 class="text-3xl font-extrabold text-slate-900 tracking-tight">APAC 2026 Planning Dashboard</h1>
+                <p class="text-slate-500 mt-1">Shorts Campaign Analysis & Strategic Planning</p>
+            </div>
+            <!-- Sync Status Indicator -->
+            <div id="cloud-status" class="text-sm font-mono text-gray-500 bg-white px-3 py-1 rounded border">
+                Connecting...
+            </div>
+        </header>
+
+        <!-- File Upload Section -->
+        <div id="upload-section" class="bg-white p-8 rounded-xl shadow-sm border border-gray-200 mb-8 text-center hidden fade-in">
+            <div class="max-w-4xl mx-auto">
+                <div class="mx-auto h-16 w-16 bg-blue-50 text-blue-600 rounded-full flex items-center justify-center mb-6">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-8 w-8" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                    </svg>
+                </div>
+
+                <div class="flex justify-center items-center gap-4 mb-4">
+                    <h2 class="text-2xl font-bold text-gray-900">Upload Data Sources</h2>
+                    <a href="https://drive.google.com/corp/drive/folders/1gL6vPS3VLIzbixoYlaEPzrBIa_8Jhhxe?resourcekey=0-xCOSifCVMMHINgftptZpYg" target="_blank" class="inline-flex items-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-600 hover:bg-blue-100 rounded-full text-xs font-medium transition border border-blue-200">
+                        <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path d="M12.01 1.984c-1.396 0-2.61.76-3.3 1.91L.775 17.848a3.86 3.86 0 000 3.82c.66 1.157 1.88 1.905 3.286 1.922h15.895c1.405-.018 2.624-.766 3.284-1.922a3.86 3.86 0 000-3.82L15.31 3.894a3.86 3.86 0 00-3.3-1.91zM4.686 18.23l4.312-7.483 4.34 7.484H4.685zm8.685 0l-4.34-7.483 4.32-7.525 4.35 7.476-4.33 7.532z"/></svg>
+                        Open Drive Folder
+                    </a>
+                </div>
+                <p class="text-gray-500 mb-8">Upload new files to automatically sync them to the Cloud Data Repository.</p>
+
+                <!-- Input Grids -->
+                <div class="grid md:grid-cols-3 gap-6 mb-8 text-left">
+                    <!-- Input 1 -->
+                    <div class="border border-gray-200 p-5 rounded-lg bg-gray-50 hover:bg-white hover:shadow-md transition group">
+                        <div class="flex items-center gap-2 mb-3">
+                            <div class="h-6 w-6 rounded bg-blue-100 text-blue-600 flex items-center justify-center font-bold text-xs">1</div>
+                            <h3 class="font-bold text-gray-900">Campaign Data</h3>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-3">Upload "Shorts HB Input" CSVs & "Fact Pack" PDF.</p>
+                        <input type="file" id="campaignFileInput" multiple accept=".csv, .pdf" class="block w-full text-xs text-gray-500 file:mr-2 file:py-2 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700 cursor-pointer"/>
+                    </div>
+                    
+                    <!-- Input 2 -->
+                    <div class="border border-gray-200 p-5 rounded-lg bg-gray-50 hover:bg-white hover:shadow-md transition group">
+                        <div class="flex items-center gap-2 mb-3">
+                            <div class="h-6 w-6 rounded bg-purple-100 text-purple-600 flex items-center justify-center font-bold text-xs">2</div>
+                            <h3 class="font-bold text-gray-900">Global Holdback</h3>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-3">Upload "Global Shorts HB" CSV files.</p>
+                        <input type="file" id="holdbackFileInput" multiple accept=".csv" class="block w-full text-xs text-gray-500 file:mr-2 file:py-2 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-purple-600 file:text-white hover:file:bg-purple-700 cursor-pointer"/>
+                    </div>
+
+                    <!-- Input 3 -->
+                    <div class="border border-gray-200 p-5 rounded-lg bg-gray-50 hover:bg-white hover:shadow-md transition group">
+                        <div class="flex items-center gap-2 mb-3">
+                            <div class="h-6 w-6 rounded bg-pink-100 text-pink-600 flex items-center justify-center font-bold text-xs">3</div>
+                            <h3 class="font-bold text-gray-900">K-Pop Data</h3>
+                        </div>
+                        <p class="text-xs text-gray-500 mb-3">Upload KPop Data and Dates CSV files.</p>
+                        <input type="file" id="kpopFileInput" multiple accept=".csv" class="block w-full text-xs text-gray-500 file:mr-2 file:py-2 file:px-3 file:rounded-md file:border-0 file:text-xs file:font-semibold file:bg-pink-600 file:text-white hover:file:bg-pink-700 cursor-pointer"/>
+                    </div>
+                </div>
+
+                <!-- NEW: Data Repository Section -->
+                <div class="mt-8 pt-8 border-t border-gray-200 text-left">
+                    <div class="flex justify-between items-end mb-4">
+                        <div>
+                            <h3 class="text-lg font-bold text-gray-800">Cloud Data Repository</h3>
+                            <p class="text-xs text-gray-500">Files below are saved permanently in the cloud (Firebase). Check box to include in analysis.</p>
+                        </div>
+                        <div class="flex items-center gap-2">
+                             <span id="sync-status" class="text-xs text-gray-400 italic">Syncing...</span>
+                             <span id="repo-count-badge" class="bg-gray-100 text-gray-600 text-xs px-2 py-1 rounded-full font-medium">0 files</span>
+                        </div>
+                    </div>
+
+                    <!-- Repo Tabs -->
+                    <div class="flex space-x-2 mb-4">
+                        <button onclick="switchRepoTab('repo-campaign')" id="btn-repo-campaign" class="repo-tab-btn active px-4 py-2 text-sm rounded-md border border-gray-200 bg-white hover:bg-gray-50 transition">Campaign Data</button>
+                        <button onclick="switchRepoTab('repo-holdback')" id="btn-repo-holdback" class="repo-tab-btn px-4 py-2 text-sm rounded-md border border-gray-200 bg-white hover:bg-gray-50 transition">Global Holdback</button>
+                        <button onclick="switchRepoTab('repo-kpop')" id="btn-repo-kpop" class="repo-tab-btn px-4 py-2 text-sm rounded-md border border-gray-200 bg-white hover:bg-gray-50 transition">K-Pop Data</button>
+                    </div>
+
+                    <!-- Repo Content Areas -->
+                    <div class="bg-gray-50 rounded-lg border border-gray-200 p-4 min-h-[150px] max-h-[300px] overflow-y-auto">
+                        <!-- Campaign Repo List -->
+                        <div id="repo-campaign" class="repo-tab-content active">
+                            <p class="text-center text-gray-400 text-sm py-8">Loading repository...</p>
+                        </div>
+                        <!-- Holdback Repo List -->
+                        <div id="repo-holdback" class="repo-tab-content">
+                            <p class="text-center text-gray-400 text-sm py-8">Loading repository...</p>
+                        </div>
+                        <!-- KPop Repo List -->
+                        <div id="repo-kpop" class="repo-tab-content">
+                            <p class="text-center text-gray-400 text-sm py-8">Loading repository...</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="flex flex-col items-center mt-8">
+                    <button onclick="processFiles()" class="px-8 py-3 bg-slate-900 text-white rounded-lg hover:bg-slate-800 transition font-medium shadow-lg hover:shadow-xl transform hover:-translate-y-0.5">
+                        Analyze Data (Uploads + Selected)
+                    </button>
+                    <p id="status-msg" class="text-sm font-medium mt-4 h-6 transition-colors duration-300"></p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Dashboard Section -->
+        <div id="dashboard-section" class="hidden fade-in">
+            <div class="mb-6 flex justify-between items-center bg-white p-3 rounded-lg border border-gray-200 shadow-sm">
+                <button onclick="showUploadSection()" class="flex items-center text-sm font-medium text-gray-600 hover:text-blue-700 transition px-3 py-1 rounded hover:bg-blue-50">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16l-4-4m0 0l4-4m-4 4h18" /></svg>
+                    Add/Manage Data Sources
+                </button>
+                <div class="text-right flex items-center gap-3">
+                    <div class="text-xs text-right">
+                        <span class="block text-green-600 font-bold uppercase tracking-wider text-[10px]">System Status</span>
+                        <span id="data-source-indicator" class="text-gray-500 font-medium">Live Cloud Data</span>
+                    </div>
+                    <div class="h-8 w-8 bg-green-100 rounded-full flex items-center justify-center text-green-600">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd" d="M16.707 5.293a1 1 0 010 1.414l-8 8a1 1 0 01-1.414 0l-4-4a1 1 0 011.414-1.414L8 12.586l7.293-7.293a1 1 0 011.414 0z" clip-rule="evenodd" />
+                        </svg>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="border-b border-gray-200 mb-6 sticky top-0 bg-gray-100 z-50 pt-2">
+                <nav class="-mb-px flex space-x-1 overflow-x-auto pb-2" aria-label="Tabs">
+                    <button onclick="switchTab('tab4')" id="btn-tab4" class="tab-btn active whitespace-nowrap py-3 px-4 border-b-2 border-transparent font-medium text-sm text-gray-500 hover:text-gray-800 hover:border-gray-300 transition">Global HB Summary</button>
+                    <button onclick="switchTab('tab1')" id="btn-tab1" class="tab-btn whitespace-nowrap py-3 px-4 border-b-2 border-transparent font-medium text-sm text-gray-500 hover:text-gray-800 hover:border-gray-300 transition">Campaign HB Regional</button>
+                    <button onclick="switchTab('tab5')" id="btn-tab5" class="tab-btn whitespace-nowrap py-3 px-4 border-b-2 border-transparent font-medium text-sm text-gray-500 hover:text-gray-800 hover:border-gray-300 transition">KPop Analysis</button>
+                    <button onclick="switchTab('tab2')" id="btn-tab2" class="tab-btn whitespace-nowrap py-3 px-4 border-b-2 border-transparent font-medium text-sm text-gray-500 hover:text-gray-800 hover:border-gray-300 transition">Key Learnings</button>
+                    <button onclick="switchTab('tab3')" id="btn-tab3" class="tab-btn whitespace-nowrap py-3 px-4 border-b-2 border-transparent font-medium text-sm text-gray-500 hover:text-gray-800 hover:border-gray-300 transition text-blue-700">Year Ahead 2026</button>
+                </nav>
+            </div>
+
+            <!-- Tabs Content -->
+            
+            <!-- Global Holdback Summary -->
+            <div id="tab4" class="tab-content active bg-white p-6 rounded-lg shadow-sm border border-gray-200 min-h-[500px] fade-in">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-900">Global Shorts Holdback Data Summary</h2>
+                    <span class="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">View: Monthly & Segmented</span>
+                </div>
+                <div id="holdback-summary-output" class="text-gray-600">
+                    <div class="flex flex-col items-center justify-center h-64 text-gray-400">
+                        <svg class="w-12 h-12 mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path></svg>
+                        <p>No data loaded. Select files from the Repository or Upload.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Campaign HB Regional -->
+            <div id="tab1" class="tab-content bg-white p-6 rounded-lg shadow-sm border border-gray-200 min-h-[500px] fade-in">
+                <div class="flex justify-between items-center mb-4">
+                    <h2 class="text-xl font-bold text-gray-900">Campaign HB Data Summary</h2>
+                    <span class="text-xs text-gray-500 bg-gray-100 px-2 py-1 rounded">Metric: DAU SCT Only</span>
+                </div>
+                <div id="summary-output" class="text-gray-600"></div>
+            </div>
+
+            <!-- KPop Analysis -->
+            <div id="tab5" class="tab-content bg-white p-6 rounded-lg shadow-sm border border-gray-200 min-h-[500px] fade-in">
+                <h2 class="text-xl font-bold text-gray-900 mb-4">KPop Campaign HB Data Summary</h2>
+                <div id="kpop-summary-output" class="text-gray-600">
+                     <div class="flex flex-col items-center justify-center h-64 text-gray-400">
+                        <svg class="w-12 h-12 mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"></path></svg>
+                        <p>Upload KPop Data and Date files to see summary here.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Learnings -->
+            <div id="tab2" class="tab-content bg-white p-6 rounded-lg shadow-sm border border-gray-200 min-h-[500px] fade-in">
+                <div class="flex items-center justify-between mb-6 pb-4 border-b border-gray-100">
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-900">Key Learnings & Executive Summary</h2>
+                        <p class="text-sm text-gray-500">2025 Retrospective based on statistical performance.</p>
+                    </div>
+                    <button onclick="copyToClipboard(this, 'learnings-output')" class="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg shadow-sm text-sm font-medium text-gray-700 hover:bg-blue-50 hover:text-blue-600 hover:border-blue-200 transition focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg> 
+                        Copy Report
+                    </button>
+                </div>
+                <div id="learnings-output" class="text-gray-600 markdown-content bg-white">
+                    <div class="p-8 border-2 border-dashed border-gray-200 rounded-lg bg-gray-50 text-center">
+                        <h4 class="font-medium text-gray-600 mb-2">Report Generation Ready</h4>
+                        <p class="text-sm text-gray-500">Upload data files and click "Analyze" to generate the narrative report.</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Year Ahead -->
+            <div id="tab3" class="tab-content bg-white p-6 rounded-lg shadow-sm border border-gray-200 min-h-[500px] fade-in">
+                <div class="flex items-center justify-between mb-6 pb-4 border-b border-gray-100">
+                    <div>
+                        <h2 class="text-2xl font-bold text-gray-900">2026 Year Ahead Strategy</h2>
+                        <p class="text-sm text-gray-500">Strategic pillars derived from 2025 performance data.</p>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="copyToClipboard(this, 'year-ahead-output')" class="flex items-center gap-2 px-4 py-2 bg-white border border-gray-300 rounded-lg shadow-sm text-sm font-medium text-gray-700 hover:bg-blue-50 hover:text-blue-600 hover:border-blue-200 transition">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg> 
+                            Copy Plan
+                        </button>
+                    </div>
+                </div>
+                <div id="year-ahead-output" class="text-gray-600 markdown-content bg-white">
+                    <p class="text-gray-500 italic">Strategy loaded from PDF context.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. GLOBAL VARIABLES & CONSTANTS ---
+        let globalData = [];
+        let globalHoldbackData = [];
+        let globalKPopData = [];
+        let globalKPopDates = [];
+        let globalPdfContext = "";
+        let allCountryData = {};
+        let learningReportMarkdown = null;
+
+        // Repository caches (loaded from Cloud)
+        let repoCache = {
+            'repo_campaign': [],
+            'repo_holdback': [],
+            'repo_kpop': []
+        };
+        
+        // --- UPDATE REPO CACHE FROM CLOUD ---
+        window.updateRepoCacheFromCloud = (cloudData) => {
+            repoCache = cloudData;
+            renderRepositoryUI();
+            
+            // UI Feedback
+            document.getElementById('sync-status').textContent = 'Synced';
+            document.getElementById('sync-status').className = 'text-xs text-green-500 italic';
+            
+            // Auto-hide overlay if we were waiting for init
+            const overlay = document.getElementById('loading-overlay');
+            if (overlay && overlay.style.display !== 'none') {
+                setTimeout(() => { overlay.style.display = 'none'; }, 500);
+            }
+        };
+
+        // --- CONTENT STRINGS ---
+        // This content mirrors the "Learnings" from the prompt logic
+        const MANUAL_LEARNINGS_CONTENT = `
+# 2025 APAC Key Results & Learnings (Executive Summary)
+
+## Executive Overview: The "Friction" & "Relevance" Game
+2025 proved that Global Scale alone fails in APAC. Success was exclusively driven when we successfully removed Psychological Friction (via templates and consistent low-friction formats rather than "tentpole Fireworks") or increased Cultural Utility (via hyper-local IP/gamification/local audio).
+
+### 1. Overall APAC Performance (Global Holdback)
+* **Positive Months:** April, July, October, November.
+* **Drivers:** Consistent contribution from Hyperlocal Evergreen (Pets/Photos/Food) and Local Audio (UTS/MVR).
+* **Exceptions:** Global BTMs only worked when heavily localized (Ed Sheeran JP, Alex Warren KR) or Gamified (F1 IN/KR), and when overlaid with "skill equalizer" feature/concept principles.
+* **Negative Months:** No overall stat sig negative months for APAC (from Apr to Dec), but significant segment-level negatives in specific markets driven by Global BTMs and SSC.
+* *Reference to appendix data below.*
+
+### 2. What Worked: The Drivers of Momentum
+
+#### 1. The "Skill Equalizer" (Low Friction Templates):
+* **a. Insight:** Users want to create but fear low quality. Templates that use existing assets (Photos) or Gen AI features remove this fear and lower the "quality" barrier.
+* **b. Proof (Campaign HB):** Hyperlocal campaigns (JP Photos: JP Female 18-24: +2.88%, JP Female 18-34: +1.7%, JP Gen pop 18-24: +1.29%, JP Gen pop 18-34: +1.1%, ID Pets: ID Gen pop 25-34: +0.26%, ID Gen pop 18-34: +0.23%, ID Gen pop: +0.26%, IN Travel: IN F25-34: +0.19%, IN F18-34: +1.7%, /IN Food: IN Gen pop 18-24: +0.12%/ IN Arts & Crafts: IN Gen pop 18-24: +0.12%, IN Male Gen Pop: +0.15%) consistently drove stat sig positive growth in the APAC Global Shorts Holdback, particularly in April, July, October, and November.
+
+#### 2. Gamifying the "Male" Barrier:
+* **a. Insight:** Young males do not "create content"; they "play games." Interactive effects tied to globally relevant Sports or Gaming IP help to bridge this gap, activating passive males.
+* **b. Proof (Campaign HB):** IN F1 BTM (Male 18-34: +0.42%); KR F1 BTM (Male 18-24: +7.73%). Roblox gaming effects (ID Female Gen Pop: +0.53%).
+
+#### 3. Audio "Drumbeats" (Consistent High Frequency Local Habits):
+* **a. Insight:** Users build habits around consistent audio formats (UTS/MVR) rather than one-off artist drops.
+* **b. Proof (Campaign HB):** KR UTS2 F18-34: +2.15%; IN MVR2 Gen Pop: +0.12%. In India, MVR ("remix" sound) significantly outperformed UTS ("use this sound") featuring the same artists, confirming that creation mechanic and feature preference alignment is critical.
+
+#### 4. Global Artist Tentpoles with hyper-localization and "skill equalizer" principles
+* **a. Insight:** The primary driver of a music campaign's success is not the artist's global fame, but the GTM execution's ability to provide a low-friction "container" for creation, with concepts customised for gender relevance (males vs females).
+* **b. Proof (Campaign HB):** Ed Sheeran JP F18-34 +1.45% lift, used a template/photo dump mechanic anchored and relatable to local user behavior in JP. Alex Warren's BTM in Korea provided a "photobooth collage" effect and a "reminiscing fond memories" template, which led to KR F Gen pop +1.31% lift. Taylor Swift's BTM succeeded in Japan, yielding F Gen pop +1.99% lift, by offering a template for her dance trend and a custom "Showgirl" effect, making participation easy and relatable for females although irrelevant for JP males.
+
+#### 5. Diversified K-pop creation ecosystem
+* **a. Insight:** K-pop's influence in APAC is best harnessed by pivoting from high-friction "dance challenges" to a diversified creation ecosystem that includes non-dance trends (transitions, vlogs, pets) and custom artists branded effects. This expansion lowers entry barriers for non-core segments (Males globally, older Gen Pop) and sustains engagement beyond initial fandom spikes.
+* **b. Proof (Campaign Holdback):** In Indonesia, non-dance concepts like fashion transitions and pet overlays unlocked DAU-SCT for young females (Baby Monster/Le Sserafim F18-34: +0.39%). In Japan, Aespa's non-dance creative engaged Male Gen Pop (+0.90%). The Aespa BTM drove DAU-SCT in Brazil (Male 25-34: +0.93%) and Germany (GenPop 25-34: +1.12%) by leveraging custom effects. The IDLE campaign's inclusion of non-dance/pet variants achieved a massive +3.27% lift for Males 18-24 in Germany.
+
+#### 6. Strategic Optimization of Discovery Surfaces
+* **a. Insight:** For trend discovery, the optimal surface is market-dependent: the Home feed Shelf format is effective for "pull" discovery in Japan, while the in-feed SSC format works for "push" discovery with specific male segments in India.
+* **b. Proof (Campaign HB):** JP Shelf (Female 18-34 +1.50%, JP Gen Pop 25-34 +0.99%), IN SSC (Male 18-34: +0.13%).
+
+### 3. What Didn't Work: The "Relevance" Gaps
+
+#### 1. Generic Global or Kpop "Tentpoles" without Localization and "skill equalizer" principles:
+* **a. Insight:** Global fame (Taylor Swift, Sabrina Carpenter) does not overcome high creation friction (complex dance challenges) or local relevance. Global BTMs are only effective when they include a low-friction template or effect mechanic (e.g., Ed Sheeran's photo dump template) customised by local relevance, gender or be gender agnostic.
+* **b. Proof (Campaign HB):** Global BTMs that failed (Taylor Swift in IN/ID/JP: IN Female 18-24: -0.76%, ID Female 25-34 -0.48%, ID Male Gen pop: -0.39%, JP Male 18-24 (-4.25%), JP Male 18-34 (-2.2%), JP Male Gen pop (-1.68%); Sabrina Carpenter BTM in KR/ID: ID Male 18-24: -1.1%, KR Gen pop 18-24: -5.09%) relied on high-friction dance challenges without sufficient hyperlocalized template and concept support. In the US, MX, FR, UK, Aespa BTM failed for Males in the US (-0.49%) and Mexico (-2.04%), likely due to low male view-share or gender-misaligned creative. In France and the UK, even with high female views (66%), Aespa BTM was negative for females, suggesting "localization failure" where creatives felt inauthentic to Western users.
+
+#### 2. Interruptive "Push" Formats in Mature Markets:
+* **a. Insight:** Forcing trends into the feed (SSC) annoys deliberate users in mature markets (JP/KR).
+* **b. Proof (Campaign HB):** SSC consistently negative in JP (F18-34 -1.07%) and KR (F25-34 -1.81%), whereas Shelf (Pull) was positive.
+
+#### 3. Misaligned "Generic" Categories:
+* **a. Insight:** "Authentic Formats" (OOTD/DIML) or misaligned Sports IP can feel generic and high-effort compared to culturally nuanced hooks.
+* **b. Proof (Campaign HB):** India "Authentic Formats" drove -0.28% for Male 25-34. Misaligned locally irrelevant Sports IP US Tennis Open ID (ID Male 25-34: -0.59%).
+
+### 4. Critical Implications for 2026
+
+#### 1. Global scaled BTMs and principles
+* **a. Stop "Lift & Shift" with feature/concept integration mandate:** Global Artists BTMs must be launched with a mandatory dedicated, low-friction creation variant (e.g., custom template, AI effect, or gallery upload functionality) that aligns with local creation trends (e.g., photo dumps, collage) to maximize conversion or be deprioritized.
+* **b. Global Inclusion of Non-Dance Mandate:** Mandate that all global K-Pop proactive campaigns include "low-friction" non-dance creative variants (transitions, pets, vlogs, photo dumps) to ensure scalability into Male and Gen Pop segments.
+* **c. Localization Pre-Approval:** Establish a localization "authenticity check" for Western markets (EMEA/LATAM) to prevent the negative incrementality observed in FR/UK where high views did not convert to creation.
+
+#### 2. Feature Investment
+* **a. AI Localization:** Invest heavily in Gen AI tools (e.g., Dream Drawing AI, as used in IN Arts & Crafts) to lower the creation barrier for high-effort categories, making advanced creative concepts accessible to Gen Pop.
+* **b. Segment-Specific Effects:** Prioritize the rollout of high-production custom artist effects customised for gender or gender agnostic (e.g., Aespa Studio Effect) in markets with high male engagement like Brazil.
+
+#### 3. Surface/Format Prioritization
+* **a. Surface Segmentation:** Kill SSC for Females in JP/KR immediately; migrate investment to Shelf. Keep SSC for Indian Males and optimize male-skewing hyperlocal trends.
+* **b. Mandate FSI Conversion:** Utilize the FSI surface for all music-led creation conversions, leveraging its proven high-impact performance over other nitrate surfaces.
+
+#### 4. Content Double Clicks
+* **a. Triple Down on Evergreen:** Expand the hyperlocal portfolio by identifying the top 3 high-demand, low-friction content verticals (e.g., Vlogs, Fitness Fails, Local Aesthetics) for each market (IN, ID, JP, KR).
+* **b. Feature and Concept Integration Mandate:** Mandate that all hyperlocal evergreen campaigns must be launched with a dedicated, low-friction creation feature (e.g., custom template, AI effect, or gallery upload functionality) to maximize conversion, mirroring the success of JP Photos.
+* **c. Elevate Hyperlocal Audio Cadence:** Increase the frequency of UTS (KR) and MVR (IN) from bi-weekly to weekly refreshes in 2026, ensuring the FSI surface is continuously fed with fresh, locally relevant audio.
+* **d. Dedicated Gamified IP Track:** Create a dedicated 2026 roadmap for 4-6 major, male-skewing global IP tentpoles (Gaming, Sports, Pop Culture) focused on interactive, gamified effect creation (e.g., skill-based games, AR challenges) for India and South Korea.
+* **e. Indonesia Sports Pivot:** For Indonesia, pivot the Sports IP strategy away from competitive games (F1, Tennis) and towards content that mirrors local creation trends (humorous/candid fitness, "fit checks" for Padel/Pickleball), ensuring the effect/concept is locally resonant.
+
+#### 5. Lifecycle Retention/habit formation
+* **a. The "Third" Segment:** We have cracked F18-34 (Easy creation: Templates) and M18-34 (Relevant Gaming/Sports IP). The 2026 battleground is Retention-turning these one-off creators into weekly actives via "Streak" mechanics.
+
+---
+
+## 1. India (IN): Key Results & Learnings
+**Behavioral Theme:** Males engage with "Skill/Play"; Gen Pop engages with "Remix Culture."
+
+### What Worked (The Drivers)
+* **Gamified Sports Activation (F1 BTM):**
+    * **Why it Worked (Hypothesis):** Young Indian males reject "performative" creation (vlogs) but engage deeply with Skill-Based Gamification. The F1 effect turned creation into a "reflex challenge," bypassing the vanity barrier.
+    * **Data Proof:** IN Global HB (July) Gen pop: +0.29%; Campaign HB: Male 18-24: +0.51%, Male 25-34: +0.36%, Male 18-34: +0.42%, Male GenPop: +0.22%.
+* **Hyperlocal "Remix" Audio (MVR):**
+    * **Why it Worked (Hypothesis):** Indian users prefer Transformative Creation ("Remix") over passive adoption ("Use This Sound"). MVR allows for "cultural co-creation."
+    * **Data Proof:** IN Global HB (Oct/Nov) Gen pop (Oct: +0.22%, Nov: +0.21%), Gen pop 18-34 (Oct: +0.26%, Nov: +0.21%), Gen pop 18-24 (Oct: +0.42%, Nov: +0.37%), Gen pop Males (Oct: +0.2%, Nov: +0.18%), Gen pop 25-34 (Oct: +0.14%); Campaign HB: MVR2 over Oct- Nov (Gen pop: +0.12%, Gen pop 18-34: +0.11%, Gen pop 25-34: +0.13%).
+* **Culturally "Deep" Verticals (Food/Arts):**
+    * **Why it Worked (Hypothesis):** Low-Friction Authenticity. "Behind the scenes" cooking and "Dream Drawing AI" lowered the barrier for Gen Pop to share hobbies without needing high production value.
+    * **Data Proof:** IN Global HB (Oct/Nov) Gen pop (Oct: +0.22%, Nov: +0.21%), Gen pop 18-34 (Oct: +0.26%, Nov: +0.21%), Gen pop 18-24 (Oct: +0.42%, Nov: +0.37%), Gen pop Males (Oct: +0.2%, Nov: +0.18%), Gen pop 25-34 (Oct: +0.14%); IN Global HB (July) Gen pop: +0.29%. Campaign HB: IN HL arts and craft (Gen pop: +0.12%, Gen pop males: +0.15%) and SSC2 (M18-34: +0.13%, Males 18-34: +0.13%) in Nov, HL food non AI (Gen pop 18-24: +0.12%), IN HL Travel CF1 (Female 25-34: +0.19%, Female 18-34: +0.14%).
+* **Hyperlocal trend via Shorts "push" surface (SSC):**
+    * **Why it Worked (Hypothesis):** "Push" (SSC) works for impulsive/bored mindsets (Males) for trend discovery and creation inspiration.
+    * **Data Proof:** IN Global HB (Oct/Nov) Gen pop (Oct: +0.22%, Nov: +0.21%), Gen pop Males (Oct: +0.2%, Nov: +0.18%), Gen pop 18-34 (Oct: +0.26%, Nov: +0.21%), Gen pop 18-24 (Oct: +0.42%, Nov: +0.37%). Campaign HB: SSC2 M18-34: +0.13% in Nov.
+
+### What Didn't Work (The Drags)
+* **Generic Global "Tentpoles" (Taylor Swift):**
+    * **Why it Failed:** Localization Mismatch. Global fame does not override high friction. The complex dance challenge and lack of hyper-local use-case lacked a "Cheat Code" (Template) for Indian users.
+    * **Data Proof:** Taylor Swift BTM IN Female 18-24 -0.76%.
+* **Generic "Authentic" Formats (OOTD/DIML):**
+    * **Why it Failed:** Relevance Gap. Generic US-style prompts (Outfit of the Day/Day in my life) feel disconnected from the "Real India" user reality compared to hyper-specific cultural hooks.
+    * **Data Proof:** Global Authentic Formats IN Male 25-34: -0.28%, IN GenPop 25-34: -0.22%, IN GenPop 18-34: -0.17%.
+
+---
+
+## 2. Indonesia (ID): Key Results & Learnings
+**Behavioral Theme:** Females need "Safe Fandom"; Males need "Hyper-Relevant IP."
+
+### What Worked (The Drivers)
+* **Pre-Existing Asset Injection (Pets):**
+    * **Why it Worked (Hypothesis):** Zero-Friction Entry. Users already have pet photos in their gallery. Prompting them to upload existing assets removes the "Capture Anxiety."
+    * **Data Proof:** ID HL Pets GenPop +0.16%, GenPop 25-34 +0.26%, GenPop 18-34 +0.23%.
+* **Non-Dance x Easy feature K-Pop (Aespa/IDLE/BabyMonster):**
+    * **Why it Worked (Hypothesis):** Inclusive Fandom. Pivot from "Dance" (High Skill) to "Transition/Effect" (Low Skill) allowed non-dancers to signal fandom identity.
+    * **Data Proof:** ID Global Shorts holdback (Aug) Females 18-24 +1.13%, campaigns driving this: Aespa Kpop proactive: ID F25-34 +0.41%, IDLE Kpop proactive 1 ID F18-24 +0.51%, Baby Monster/ Le Sseraffim Kpop proactive 3 ID F18-34 +0.39%.
+* **Pop Culture Alignment (Lady Gaga/Roblox):**
+    * **Why it Worked (Hypothesis):** Identity Signaling. Wednesday Dance (Gaga) and Roblox aligned with specific subcultures (Horror/Gaming), driving identity-based creation.
+    * **Data Proof:** Lady Gaga BTM ID Male 25-34 +0.80%, ID Male 18-34 +0.47%, ID Male GenPop +0.33%; Roblox ID F 25-34 +0.67%, ID F Gen pop +0.53%.
+
+### What Didn't Work (The Drags)
+* **Misaligned Sports IP (F1/Tennis):**
+    * **Why it Failed:** Cultural Disconnect. Unlike India, F1/Tennis are not "mass" in ID. The gamified effects failed because the underlying IP lacked cultural currency compared to local sports (Padle, Pickelball etc.).
+    * **Data Proof:** ID Global Shorts holdback (Aug) Males 18-24 -0.5%, campaigns driving this: F1 Effect BTM (June to July) ID Male 25-34 -0.61%, ID Males 18-34 -0.49%, ID Gen pop -0.28%. ID Global Shorts holdback (Sept) Males 18-24 -0.72%, campaigns driving this: US Tennis Open effect Male 25-34 -0.59%, Genpop -0.21%.
+* **Gender disconnect (Global scaled artist BTMs):**
+    * **Why it failed:** Global Artist BTMs (Sabrina/Taylor) are only effective when they include a low-friction template or effect mechanic (e.g., Ed Sheeran's photo dump template) customised by local relevance, gender or be gender agnostic.
+    * **Data Proof:** ID Global Shorts holdback (Sept) Males 18-24 (-0.72%), campaigns driving this: Sabrina Carpenter BTM: Male 18-24 (-1.1%). ID Global Shorts holdback (Nov) Males 18-34 (-0.03%), campaigns driving this: Taylor Swift BTM: Female 25-34 (-0.48%), Male Gen pop (-0.39%) over Oct to Nov.
+* **Interruptive Trends (Shelf 2):**
+    * **Why it Failed:** Curatorial Failure. The specific hyper-local trend selection (Lip Sync/Dance) on Shelf 2 failed to resonate, causing negative sentiment, might be a result of strong competition in the market (Tik Tok).
+    * **Data Proof:** ID Global Shorts holdback (Nov) Males 18-34 (-0.03%), campaigns driving this: Shelf2: Male 18-24 -0.75%, Male Gen pop -0.3%, Gen pop 18-24 -0.57%, Gen pop -0.18%.
+* **Saturated Cultural Tentpole:**
+    * **Why it Failed:** Potentially due to poor timing (creation peaked later during the campaign during the celebration and holidays of Ramadan, versus at the first half of the campaign during the fasting period) or the inability to have a highly differentiated creative during such a saturated cultural tentpole due to strong competitive marketing activity from Tik Tok or Instagram in Indonesia.
+    * **Data Proof:** ID Ramadan Gen pop 25-34 (-0.23%), Gen pop 18-34 (-0.2%).
+
+---
+
+## 3. Japan (JP): Key Results & Learnings
+**Behavioral Theme:** The "Aesthetic Shield" and "Local Concept" Fit is mandatory; Interruptions are rejected.
+
+### What Worked (The Drivers)
+* **The "Aesthetic Shield" (HL Photos):**
+    * **Why it Worked (Hypothesis):** Privacy by Design. JP users fear showing faces ("Face Reveal Anxiety"). High-fidelity "Faceless" templates (vlogs, fashion fit checks, cafe highlights, not showing faces etc) provided a safety shield.
+    * **Data Proof:** JP Global Shorts Holdback (July): Female 18-24 +1.19%, Gen pop +0.95%, Aug: Female 18-24 +3.3%, Sept: Female 18-24 +4.15%, Gen pop 18-24 +2.9%, campaign driving this, JP HL photos (April to Oct): JP Females 18-24 +2.88%, JP Females 18-34 +1.7%, JP Gen pop 18-24 +1.29%, JP Gen pop 18-34 +1.1%.
+* **Pull Discovery (Shelf):**
+    * **Why it Worked (Hypothesis):** Deliberate Intent. Japanese users prefer to opt-in to trends (Shelf) rather than have them forced into their Shorts feed. Inclusion of hyperlocal artists and expansion of trend use cases beyond dance (from illustration, to gaming, Pets, Lip Syncs and Transitions) also helped.
+    * **Data Proof:** P Global Shorts Holdback (July): Female 18-24 +1.19%, Gen pop +0.95%, Aug: Female 18-24 +3.3%, Sept: Female 18-24 +4.15%, Gen pop 18-24 +2.9%, campaign driving this, Shelf1 (April to Oct): JP Females 18-34 (+1.5%), JP Gen pop 25-34 (+0.99%).
+* **Localized Global Kpop/Artist BTM with low friction templates and female customisation:**
+    * **Why it Worked (Hypothesis):** Concept Fit. The Ed Sheeran campaign didn't ask for a dance; it asked for a "Travel Photo Dump, reminiscing memories" (matching local behavior and creation use cases). Taylor Swift BTM 's usage of the template feature for the dance trend and the custom effect to give local users a "Showgirl" moment of their own, were all relevant to the Japanese local female, as seen from the success of Hyperlocal photos campaign which focuses on easy creation features. Aespa's artist-led non-dance (transition) trend creative helped provide expanded use cases for local users to create, beyond dance challenges, making it more relatable to Gen Pop Males.
+    * **Data Proof:** JP Global Shorts Holdback (July): Female 18-24 +1.19%, Gen pop +0.95%, Aug: Female 18-24 +3.3%, Sept: Female 18-24 +4.15%, Gen pop 18-24 +2.9%, campaign driving this, ED Sheeran BTM (June to July): Females 18-34 +1.45%, Male Gen pop +0.88%, Gen Pop 25-34 +1.44%, Gen Pop 18-34 +1.12%, Aespa Non dance CF Kpop proactive (July): Male Gen Pop +0.9%. Taylor Swift BTM (Oct - Nov): JP Female Gen pop +1.99%.
+
+### What Didn't Work (The Drags)
+* **Interruptive Push (SSC):**
+    * **Why it Failed:** Format Friction. Inserting trends into the viewing feed (SSC) is perceived as "noise" by deliberate JP users, leading to active rejection vs the success of Shelf for Japan.
+    * **Data Proof:** SSC1 (Apr to Nov): JP Female 18-34 -1.07%, JP Female 25-34 -1.6%, Gen pop 25-34 -1.34%.
+* **Concept mismatch on Hyperlocal scaled creation (APAC Food effects):**
+    * **Why it Failed:** Concept Disconnect. APAC custom cooking effect game ("Flip Pan Game") doesn't match with how food content comes to life locally in Japan (e.g. storytelling, highlighting cafe and restaurants with rich histories, while enjoying the food).
+    * **Data Proof:** APAC Food effects (Aug): JP Gen pop -0.48%.
+* **Video collagens may be more inspiring than photo dumps on HL scaled creation (Autumn Non AI):**
+    * **Why it Failed:** Concept Disconnect. The JP Autumn Non AI Hyperlocal assets only had language localization from the Korea assets, focused on static photo dumps, while the AI assets (both human and non-human) feature a collage of engaging videos, this might have led to the video collages being more engaging and inspiring to create vs the static photo dumps.
+    * **Data Proof:** Autumn Non AI Hyperlocal scaled creation (Nov): JP Gen pop 25-34 -0.9%, JP Gen pop 18-34 -0.7%.
+* **Gender Mismatch or in-market competing hyper-local trending songs impacting Artist BTMs:**
+    * **Why it Failed:** Alienation. The Taylor Swift "Showgirl" concept was too female-coded, actively alienating the JP Male segment without a generic variant. Stray Kids Proactive Campaign even with alternative creative concepts (e.g., featuring pets) for the "Ceremony" song and the established popularity of Stray Kids among Japanese females (evidenced by 86% female views on their channel and 80% on the song itself), may be attributed to competing trending songs from other artists, such as HANA and Snowman, which were highly popular during the same timeframe.
+    * **Data Proof:** Taylor Swift BTM (Oct - Nov): JP Male 18-24 -4.25%, JP Male 18-34 -2.2%, JP Male Gen pop -1.68), Kpop1 (Stray Kids) (Sept): JP Females Gen pop -1.03%.
+
+---
+
+## 4. South Korea (KR): Key Results & Learnings
+**Behavioral Theme:** High-Octane Gaming for Males; "Drumbeat" Audio and "Local Concept Fit" for Females.
+
+### What Worked (The Drivers)
+* **Gamified "Hyper-Skill" (F1 BTM):**
+    * **Why it Worked (Hypothesis):** Competitive Utility. Korean males engaged with the F1 effect not as "content" but as a "high score challenge" to beat peers.
+    * **Data Proof:** F1 BTM (Jun - Jul): KR Male 18-24 (+7.73%), KR GenPop 18-24 (+2.79%) (Massive outlier).
+* **Audio "Drumbeats" (UTS):**
+    * **Why it Worked (Hypothesis):** Cognitive Ease. The "Use This Sound" (UTS) format simplifies the decision tree. Regular bi-weekly prompts built a predictable habit.
+    * **Data Proof:** South Korea Global Shorts holdback (Oct): Female 25-34: +3.39%, Female 18-34: +2.55% and Female Gen pop: +1.23%, campaign driving this: UTS1 (Apr to Oct): Female 18-24: +1.83%, Female 25-34: +1.26%. South Korea Global Shorts holdback (Nov): Female 18-34: +2.54%, Female 25-34: +3.82%, Female Gen pop: +1.01%, campaign driving this: UTS2 (Nov to Dec): Female 18-34: +2.15%.
+* **Localized Global Artist BTM with low friction templates and female customisation:**
+    * **Why it Worked (Hypothesis):** Concept Fit. The Alex Warren BTM template concept in particular that was anchored on "reminiscing fond memories" and the effect concept anchored on a simple photobooth collage, all relatable concepts for Korean young females to lower the barrier for creation.
+    * **Data Proof:** Alex Warren BTM (Jul-Aug): KR Female GenPop (+1.31%).
+
+### What Didn't Work (The Drags)
+* **Interruptive Push (SSC):**
+    * **Why it Failed:** Similar to Japan, KR users rejected "forced" trends in the feed is perceived as "noise" by deliberate KR users, leading to active rejection.
+    * **Data Proof:** South Korea Global Shorts holdback (Oct): Male GenPop: -1.29%, campaigns driving this: SSC1 (Apr- Oct): Campaign holdback Female 25-34 (-1.81%) and Female 18-34 (-1.34%).
+* **Mainstream K-Pop (Aespa):**
+    * **Why it Failed:** Saturation/Fatigue. Standard "Dance Challenges" amongst more mainstream Korean Kpop artists might be saturated in KR. Without a novel hook (like Alex Warren's photo template), they fail to drive incremental lift.
+    * **Data Proof:** Aespa CF 1 (dance) (June): KR Gen pop -0.36%, Aespa CF2 (Non Dance) (July): KR Female 18-34 -1.63%.
+* **Misaligned Global "Tentpoles" (Sabrina):**
+    * **Why it Failed:** Broad lift and scaled US/Global Artist campaigns (e.g. Sabrina), will need a dedicated pivot in strategy to hyper-localize content and concepts further for the Korean user (e.g. Alex Warren effects and template concepts are good examples that were relevant to the local user insight).
+    * **Data Proof:** Sabrina BTM (Sept): Gen Pop 18-24 -5.09%.
+
+---
+
+## 5. Rest of World (ROW): K-Pop Learnings
+**Behavioral Theme:** Western markets reject "Inauthentic" localized efforts; LATAM/EMEA Males embrace "High-Production" Effects.
+
+### What Worked (The Drivers)
+* **High-Production "Studio" Aesthetic with triple-variant creatives (easy effects, non-dance creatives and artist dance) (Brazil, Germany, Mexico, Indonesia):**
+    * **Why it Worked (Hypothesis):** Aspiration vs. Imitation. Males in BR/DE and Females in Mexico, may not have wanted to dance, but they did want the "K-Pop Star Aesthetic." High-fidelity custom effects and non-dance creative variants, allowed them to embody the fandom of Aespa/IDLE without performing the choreography.
+    * **Data Proof:** Aespa (Dirty Work) BTM: Brazil Male 25-34 +0.93%, Brazil Male 18-34 +0.77%, Brazil Male Gen pop +0.37%, Brazil Gen pop 25-34 +0.44%, Brazil Gen pop 18-34 +0.38%; Germany Gen Pop 25-34 +1.12%; Mexico Females 25-34 +0.87%. IDLE (Non-Dance) proactive: Brazil Female 25-34: +0.68%; Germany Male 18-24 +3.27%, Male 18-34 +1.57%; Indonesia Female 18-24 +0.51%.
+* **Diversified "Cute" Culture (Brazil):**
+    * **Why it Worked (Hypothesis):** Universal "Cute" Appeal. Stray Kids utilized a dual-variant strategy: "Pet UGC" (cats dancing) alongside the artist, another with the artist dance. This tapped into universal pet culture, transcending fandom barriers.
+    * **Data Proof:** Stray Kids Proactive: Brazil Female Gen Pop +0.28%.
+
+### What Didn't Work (The Drags)
+* **Localization Failure (France & UK):**
+    * **Why it Failed:** The "Uncanny Valley" of Localization. Despite high views (FR female views 66%, UK female views 66%), campaigns failed to drive DAU-SCT. Creatives may have felt "inauthentic" or forced to Western European users, unlike the organic uptake in LATAM.
+    * **Data Proof:** Aespa (Dirty Work) BTM: France Female 25-34: -1.99%, France Female 18-34: -1.38, UK Female Gen pop: -0.76%, Indonesia Female Gen pop: -0.28%.
+* **Male Gender Mismatch (US, Mexico, Japan):**
+    * **Why it Failed:** Low Relevance. Aespa's Dirty Work song Male view share was lower in Mexico and US vs other markets (Mexico Male Views- 38%, US song views-41%) and the creative for both Aespa and BabyMonster was purely "Girl Group Aesthetic" without a gender-neutral bridge (like Gaming/Tech) negatively impacting male population.
+    * **Data Proof:** Aespa (Dirty Work) BTM: United States Male 18-34: -0.49%, Mexico Male 18-24: -2.04%, Mexico Male 18-34: -0.93%. BABYMONSTER proactive: Japan Male 25-34: -1.77%, Japan Male Gen pop: -0.72%, Japan Genpop 25-34: -1.13%.
+
+---
+
+## Appendix
+**Months with APAC (IN, ID, JP, KR) Stat sig positive DAU-SCT on Global Shorts holdback and Campaign drivers 2025**
+
+* **April Global Holdback:** Stat Sig Positive for Males 18-24 (+0.16%) and Males 18-34 (+0.07%).
+    * Campaign Evidence: JP Hyperlocal Photos (F18-24 +2.88%, F18-34 +1.70%, Gen Pop 18-24 +1.29%, Gen Pop 18-34 +1.10%), JP Shelf1 (Apr - Oct) (F18-34 +1.50%, Gen Pop 25-34 +0.99%), ID HL Pets (Apr- Jul) (Gen Pop 25-34 +0.26%, Gen pop 18-34: +0.23%, Gen pop +0.16%), KR UTS1 (Apr-Oct) (F18-24 +1.83%, F25-34 +1.26%).
+* **July Global Holdback:** Stat Sig Positive for Gen Pop 18-34 (+0.28%) and Gen Pop (+0.27%).
+    * Campaign Evidence: IN F1 BTM (M18-34 +0.42%), IN Travel CF1 (July - Aug) (F25-34 +0.19%, F18-34 +0.14%), ID HL Pets (Apr- July) (Gen pop 25-34 +0.26%, Gen pop 18-34(+0.23%, Gen pop +0.16%), ID Aespa (F25-34 +0.41%), JP HL Photos (Mar - Oct) (F18-24 +2.88%, F18-34 +1.70%, Gen Pop 18-24 +1.29%, Gen Pop 18-34 +1.10%), JP Shelf 1 (Apr-Oct) (F18-34 +1.50%, Gen Pop 25-34 +0.99%), JP EdSheeran (June-July) (F18-34 +1.45%, Male Gen Pop +0.88%, Gen Pop 25-34 +1.44%, Gen Pop 18-34 +1.12%), JP Aespa Non Dance CF (M Gen Pop +0.90%), KR UTS1 (Apr-Oct) (F18-24 +1.83%, F25-34 +1.26%), KR F1 BTM (M18-24 +7.73%), KR Alex Warren (Female Gen Pop +1.31%).
+* **October Global Holdback:** Stat Sig Positive for Male 18-24 +0.41%, Male 25-34 +0.07%, Male 18-34 +0.21%, Male Gen pop +0.18%, Gen pop 18-24 +0.45%, Gen pop 25-34 +0.21%, Gen pop 18-34 +0.3%, Gen pop +0.23%.
+    * Campaign Evidence: IN MVR2 (Gen Pop +0.12%, Gen pop 25-34 +0.13%, Gen pop 18-34 +0.11%, Female 25-34 +0.26%, Female 18-34 +0.21%), IN HL Food Non-AI (Gen Pop 18-24 +0.12%), KR UTS1 (F18-24 +1.83%), ID Kpop proactive ROW3 (Oct - Dec) (Female 18-34 +0.39%), JP HL Photos (Mar - Oct) (Female 18-24 +2.88%, Female 18-34 +1.7%, Gen pop 18-24 +1.29%, Gen pop 18-34 +1.1%), JP Shelf 1 (Apr-Oct) (F18-34 +1.50%, Gen Pop 25-34 +0.99%), JP Taylor Swift BTM (Oct - Nov) (Female Gen pop +1.99%), KR UTS1 (Apr - Oct) (Female 18-24 +1.83%, Female 25-34 +1.26%).
+* **November Global Holdback:** Stat Sig Positive for Males 18-24 (+0.38%, Male Gen pop +0.16%, Gen pop 18-24 +0.39%, Gen pop 18-34 +0.22%, Gen pop +0.2%.
+    * Campaign Evidence: IN MVR2 (Oct - Nov) (Female 25-34 +0.26%, Female 18-34 +0.21%, Gen pop 25-34 +0.13%, Gen pop 18-34 +0.11%, Gen pop +0.12%), IN HL Food Non AI (Oct - Nov) (Gen pop 18-24 +0.12%), IN SSC2 (Nov - Dec) (Male 18-34 +0.13%), IN Arts & Craft (Nov - Dec) (Male Gen pop +0.15%, Gen pop +0.12%), ID Kpop proactive ROW3 (Oct - Dec) (Female 18-34 +0.39%), JP Taylor Swift BTM (Oct - Nov) (Female Gen pop +1.99%), KR UTS2 (Nov - Dec) (Female 18-34 +2.15%).
+`;
+
+        const MANUAL_YEAR_AHEAD_CONTENT = `
+# 2026 Shorts Experiment Learning Agenda
+
+### Pillar 1: The "Ability" Lever (Frictionless Expression)
+
+**Behavioral Mechanism:** Drastically reducing the "Time-to-Quality" ratio. Users have the intent but lack the skill/time to produce "socially acceptable" content.
+
+**2026 Experiment:** "Asset-First" Creation. Shift from "Shoot New" to "Upload Old."
+
+**Hypothesis:** If we provide high-fidelity templates that utilize pre-existing gallery assets (photos/videos), we unlock latent supply from "Lurker" segments (F18-34, Gen Pop) who fear poor production quality.
+
+**Data Proof Points (Success Signals):**
+* Japan (Photos): F18-24 **<span class="text-green-600 font-bold">+2.88%</span>**, F18-34 **<span class="text-green-600 font-bold">+1.7%</span>** (Global HB).
+* Indonesia (Pets): Gen Pop 25-34 **<span class="text-green-600 font-bold">+0.26%</span>**, Gen Pop **<span class="text-green-600 font-bold">+0.16%</span>**.
+* India (Travel): F18-34 **<span class="text-green-600 font-bold">+0.14%</span>**.
+
+---
+
+### Pillar 2: The "Motivation" Lever (Gamification & Competition)
+
+**Original Scope:** Next-Gen Male Activation (Source Pillar 5)
+
+**Behavioral Mechanism:** Reframing "Creation" as "Play." Young males reject "performative" creation (vlogging/dancing) but engage deeply with "skill-based" interactions.
+
+**2026 Experiment:** "Skill-Based" Interactive Effects. Pivot Sports/Gaming IP from passive viewing to active "challenges" (Reflex tests, Scores).
+
+**Hypothesis:** If we anchor creation in gameplay mechanics (scores, challenges) tied to Sports/Gaming IP, we bypass the "vanity barrier" for M18-34.
+
+**Data Proof Points (Success Signals):**
+* Korea (F1 BTM): M18-24 **<span class="text-green-600 font-bold">+7.73%</span>** (Campaign HB).
+* India (F1 BTM): M18-34 **<span class="text-green-600 font-bold">+0.42%</span>**, M18-24 **<span class="text-green-600 font-bold">+0.51%</span>**.
+* Indonesia (Roblox): Female Gen Pop **<span class="text-green-600 font-bold">+0.53%</span>** (Gamification works for females too if IP aligns).
+
+---
+
+### Pillar 3: The "Identity" Lever (Fan Association without Performance)
+
+**Behavioral Mechanism:** Lowering "Social Risk." Users want to signal fandom (Identity) but fear the social risk of performing complex tasks (Dancing).
+
+**2026 Experiment:** The "Non-Dance" Mandate. All Music/IP campaigns must offer a "low-risk" path (Transition, Photo Dump, Tech Overlay) to allow fandom signaling without performance.
+
+**Hypothesis:** If we offer non-dance variants (e.g., Tech overlays, Transitions), we expand the Total Addressable Market (TAM) of creators beyond "Core Fans" to Gen Pop and Males.
+
+**Data Proof Points:**
+* Indonesia (K-Pop): F18-34 **<span class="text-green-600 font-bold">+0.39%</span>** via non-dance fashion transitions/pets.
+* Japan (Aespa): Male Gen Pop **<span class="text-green-600 font-bold">+0.90%</span>** via non-dance transition creative.
+* ROW Context: Brazil Male 25-34 **<span class="text-green-600 font-bold">+0.93%</span>** (Aespa Custom Effect).
+
+**Data Proof Points (Failure Signals - High Risk):**
+* Japan (Taylor Swift): M18-24 **<span class="text-red-600 font-bold">-4.25%</span>** (High friction/Gender mismatch).
+* India (Taylor Swift): F18-24 **<span class="text-red-600 font-bold">-0.76%</span>** (Generic BTM failed).
+
+---
+
+### Pillar 4: The "Trigger" Lever (Habit Formation)
+
+**Behavioral Mechanism:** "Drumbeat" Consistency. Creation is a habit, not a one-off event. Regular, predictable triggers reduce the cognitive load of "deciding" to create.
+
+**2026 Experiment:** High-Frequency Local Audio Cycles. Move from "Big Bang" drops to bi-weekly "Drumbeats" of Hyperlocal Audio (UTS/MVR) via high-visibility surfaces (FSI).
+
+**Hypothesis:** Sustained, bi-weekly exposure to hyperlocal audio cues creates a pavlovian creation response, driving higher LTV than sporadic Global hits.
+
+**Data Proof Points (Success Signals):**
+* Korea (UTS): Sustained F18-34 **<span class="text-green-600 font-bold">+2.15%</span>** (Nov), F18-24 **<span class="text-green-600 font-bold">+1.83%</span>** (Apr-Oct).
+* India (MVR): Gen Pop **<span class="text-green-600 font-bold">+0.12%</span>** (Oct-Nov).
+
+---
+
+### Pillar 5: The "Context" Lever (Push vs. Pull Discovery)
+
+**Behavioral Mechanism:** Matching Mindset to Surface. "Push" (SSC) works for impulsive/bored mindsets (Males). "Pull" (Shelf) works for deliberate/seeking mindsets (Females/Mature Markets).
+
+**2026 Experiment:** Surface Segmentation. Deprioritize "Interruptive" formats for sensitive segments; double down on "Discovery" formats.
+
+**Hypothesis:** Aligning the discovery surface (Shelf vs. SSC) with the user's intent state (Browsing vs. Watching) eliminates negative sentiment and churn.
+
+**Data Proof Points (Success Signals):**
+* Japan (Shelf): F18-34 **<span class="text-green-600 font-bold">+1.50%</span>** (Shelf is valid "Pull").
+* India (SSC): M18-34 **<span class="text-green-600 font-bold">+0.13%</span>** (SSC is valid "Push" for young males).
+
+**Data Proof Points (Failure Signals):**
+* Japan (SSC): F18-34 **<span class="text-red-600 font-bold">-1.07%</span>** (Interruptive).
+* Korea (SSC): F25-34 **<span class="text-red-600 font-bold">-1.81%</span>** (Interruptive).
+
+---
+
+### Pillar 6: The "Retention" Lever (Solving Churn)
+
+**Behavioral Mechanism:** The "Small Win" Loop. Activating a user once is easy; getting them back requires immediate reinforcement.
+
+**2026 Experiment:** The "Streak" & "Remix" Loop.
+
+**Hypothesis:** If we re-target a first-time creator within 7 days with a "Low Stakes" follow-up (e.g., "Remix your own video" or "Join Week 2 of this Challenge"), we reduce D30 churn.
+
+**Data Rationale:** Inferred from the high "spike" nature of tentpole campaigns (e.g., Ramadan in ID/IN) that faded quickly or turned negative, suggesting high churn after the event.
+
+| Strategic Pillar | Target Segment | 2025 Data-Driven Insight (The "Why") | Strategic Hypothesis (Behavioral Insight) | Experiment Title | Experiment Hypothesis (The "If > Then") |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **1. The "Retention" Lever (Solving Churn)** | APAC Gen Pop | Insight: High churn followed "Spike" campaigns (Ramadan). First-time creators likely churn because the second action feels too hard.<br><br>New: Leveraging the "Endowment Effect" of the first video. | Hypothesis: First-time creators churn because the "Second Action" cost is too high. Leveraging the "Endowment Effect" (ownership of past success) reduces this friction. | **The "Smart Remix" Re-Trigger** | IF we prompt a user to "Remix" their own top-performing video or comment within 7 days (low cognitive load), THEN D30 retention will improve by bridging the gap between "One off creator" and "Weekly Active". |
+| | IN/KR Gen Pop | **Audio Consistency vs. Tentpole Churn.** High-frequency audio programs like KR UTS (**<span class="text-green-600 font-bold">+2.15%</span>**) and IN MVR (**<span class="text-green-600 font-bold">+0.12%</span>**) drove sustained engagement, whereas major "Tentpole" events (e.g., Ramadan) often showed sharp declines or negative tails immediately after the event, indicating high churn once the "Big Bang" moment passed. | Hypothesis: Users respond to "Completion Bias". Framing creation as a streak or set (1/3) creates a compulsion to complete the pattern. | **Audio "Streak" Mechanics** | IF we frame UTS/MVR not as a single action but a "Weekly Challenge" (Create 1 of 3), THEN we will increase creation and DAU-SCT frequency per user. |
+| **2. The "Ability" Lever (Frictionless Expression)** | JP/IN Females 18-34 | Insight: JP Photos (**<span class="text-green-600 font-bold">+2.88%</span>**) and ID Pets (**<span class="text-green-600 font-bold">+0.26%</span>**) proved that using latent assets (gallery photos) removes the "Quality Judgment" barrier better than shooting new content.<br><br>New: IN Arts (**<span class="text-green-600 font-bold">+0.12%</span>**) proved Gen AI lowers the barrier for complex concepts. | Hypothesis: Users possess latent assets (photos) but fear "Quality Judgment." Providing "Aesthetic Scaffolding" (templates) removes the vanity barrier. | **"Asset-First" GenAI Templates** | IF we launch high-fidelity "Faceless" templates (e.g., Cafe/Vlog/Travel) and Gen AI tools (Dream Drawing) that use existing gallery photos/videos, THEN we will scale F18-34 DAU-SCT by bypassing the "Shoot New" Friction point, capitalizing on the success of JP Photos (**<span class="text-green-600 font-bold">+2.88%</span>**). |
+| | ID/KR Gen Pop | Insight: The "Zero-Friction" Asset Proof. ID Pets (**<span class="text-green-600 font-bold">+0.26%</span>**) and JP Photos (**<span class="text-green-600 font-bold">+2.88%</span>**) proved that DAU-SCT spikes when we ask users to upload existing assets rather than shoot new ones. The barrier isn't a lack of ideas, but the effort of "Capture Anxiety" which gallery-based prompts eliminate. | Hypothesis: "Blank Canvas Paralysis" stops creation. Pre-clustering assets reduces the "Time-to-Quality" ratio to near zero. | **Gallery Mining "Memory" Prompts** | IF we proactively bundle user photos into "Your Week in Review" drafts (similar to ID Pets **<span class="text-green-600 font-bold">+0.26%</span>**), THEN we unlock time-poor Gen Pop segments who won't shoot net-new content. |
+| | ID/KR/JP Gen Pop | Insight: The "Vertical Bridge" (Pets x Pop). Stray Kids succeeded in Brazil (Female Gen Pop **<span class="text-green-600 font-bold">+0.28%</span>**) and IDLE in Indonesia (Female 18-24 **<span class="text-green-600 font-bold">+0.51%</span>**) by including a "Pet UGC" .Users who felt alienated by the "Fandom" barrier (Dance) felt safe entering via the "Pet" vertical because the focus was on their animal, not them. | Hypothesis: Users and fandom possess the intent to create but "dance" may be too high a barrier for entry, Pets or gender agnostic categories may help provide a safe entry point to creation. | **"Pet-Pop" or gender agnostic Category Cross-Over Challenges** | IF we mandate a "Pet Variant/gender agnostic category for every major K-Pop release (e.g., "Make your Cat dance to [Song Name]"), THEN we bridge the gap between "Niche Fandom" and "Mass Gen Pop" by leveraging the universal, low-friction appeal of Pet content. |
+| | IN Gen Pop | Insight: Remix vs. Adoption. Indian users preferred MVR (Remix) over UTS (Use This Sound). The insight is that IN Gen Pop prefers "Collaborative Completion" (adding to something) over "Passive Usage" (starting from scratch). | Hypothesis: Indian users prefer collaborative creation (remixing from others) vs starting from scratch, providing existing remixable templates and prompts will lower the creation barrier. | **"Chain Reaction" Templates** | IF we launch "Finish this Skit" or "React to this Outcome" templates (using Split Screen/Green Screen as the default state), THEN we maximize the "Remix" behavior (**<span class="text-green-600 font-bold">+0.12%</span>**) by providing a creative "Prompt" that demands a specific, low-effort "Answer". |
+| **3. The "Motivation" Lever (Gamification)** | IN/KR Males 18-34 | Insight: Young males reject performative vlogging but obsess over "Skill." KR F1 (**<span class="text-green-600 font-bold">+7.73%</span>**) and IN F1 (**<span class="text-green-600 font-bold">+0.51%</span>**) proved that interactive scores drive male creation.<br><br>Gap: Generic Sports (Tennis **<span class="text-red-600 font-bold">-0.59%</span>** ID) failed due to lack of local relevance. | Hypothesis: Young males reject "performative" creation (vlogging, dance) but engage deeply with "Skill-Based Play" (Competition). | **Hyper Local Gamified Sports IP (Cricket/Baseball)** | IF we replicate the F1 gamified effect (**<span class="text-green-600 font-bold">+7.73%</span>** lift) with mass local IP (IPL Cricket in IN, KBO Baseball in KR), THEN we will activate the "Passive Male" segment at scale by reframing creation as "Competition". |
+| **4. The "Motivation" Lever (Aesthetic Identify)** | JP/ROW Males 18-34 | Insight: JP Males rejected the "Flip Pan" game (**<span class="text-red-600 font-bold">-0.48%</span>**) but accepted Aespa Non-Dance (**<span class="text-green-600 font-bold">+0.90%</span>**). They want Identity Association without "Silly" gameplay.<br><br>Pivot: Distinction between "Active Play" (KR) and "Aesthetic Cool" (JP). | Hypothesis: "Fantasy" appeals where "Performance" fails. Users want to embody a character/skill without showing their face. | **Non-Gamified "Aesthetic" Effects or Overlays (JRPG)** | IF we offer "Aesthetic" overlays (e.g., JRPG stats, Fantasy/Cyberpunk UI) instead of active games for JP/ROW Males, THEN we engage introverted male segments who want to signal identify without "performing" and who rejected the "Flip Pan" game (**<span class="text-red-600 font-bold">-0.48%</span>**). |
+| **5. The "Motivation" Lever (Validation)** | IN/Emerging Market Gen pop | Insight: The "Generic Authenticity" Failure. India Males rejected generic "Authentic" Formats like OOTD/DIML (Male 25-34 **<span class="text-red-600 font-bold">-0.28%</span>**) because they felt "boring" or culturally disconnected. Conversely, "Deep Verticals" like Arts & Crafts (**<span class="text-green-600 font-bold">+0.12%</span>**) and Food (**<span class="text-green-600 font-bold">+0.12%</span>**) worked. The motivation isn't "Share your Life" (Generic); it's "Show your Skill" (Specific). | Hypothesis: Young males reject "generic/lifestyle" creation (day in my life, OOTD) but engage deeply with "Skill-Based prompts" (Flexing their skills). | **"Hobby Hero" Prompts** | IF we replace generic "Day in the Life" prompts with specific "Micro-Skill" prompts (e.g., "Show your sketching process," "Plating your dinner"), THEN we reverse the negative lift in IN Male 25-34 by validating their specific interests rather than their generic lifestyle. |
+| **6. The "Identity" Lever (Fan Association)** | ID / JP Gen Pop | Insight: Taylor Swift failed in JP (**<span class="text-red-600 font-bold">-4.25%</span>** Males) due to high friction/gender alienation. Aespa Non-Dance succeeded (**<span class="text-green-600 font-bold">+0.90%</span>**) by offering a "Fan Overlay" entry point.<br><br>Mandate: "Global Scale" requires "Skill Equalizer" variants. | Hypothesis: Users want to signal fandom (Identity) but fear the "Social Risk" of dancing. Non-dance formats lower this risk. | **The Non- Dance K-Pop Mandate** | IF we mandate "Transition" or "Tech Overlay" variants for all K-Pop briefs (bypassing dance), THEN we unlock the "Silent Fan" segment (Gen Pop/Males) who want to signal fandom without learning choreography, as seen with Aespa Non-Dance (**<span class="text-green-600 font-bold">+0.90%</span>**). |
+| | IN/ID Males 18-34 | Insight: The "Relevance Gap" in Sports. The failure of Global Sports IP in Indonesia (F1/Tennis: Male 25-34 **<span class="text-red-600 font-bold">-0.61%</span>**) proved that generic "Gamified Effects" fail if the underlying IP lacks cultural currency. Males rejected "Global Cool" in favor of "Local Relevance," necessitating a pivot to sports they actually play (Padel/Pickelball/Badminton). | Hypothesis: Males align with "Activity" identity (Sports/Hobbies) rather than "Fandom" identity. | **Local Sports "Fit Check" Templates** | IF we pivot from "Game" effects to "Fit Check" templates for Padel/Badminton (ID) or Cricket (IN), THEN we fix the negative lift in M25-34 (**<span class="text-red-600 font-bold">-0.61%</span>**) by aligning with actual local creation habits. |
+| **7. The "Trigger" Lever (Habit Formation)** | IN / KR Gen Pop | Insight: KR UTS (**<span class="text-green-600 font-bold">+2.15%</span>**) and IN MVR (**<span class="text-green-600 font-bold">+0.12%</span>**) proved that consistent audio cues work. However, "Tentpole Spikes" (Ramadan) often led to churn/negatives.<br><br>Pivot: Shift from "Big Bang" to "Weekly Drumbeat." | Hypothesis: "Drumbeat" consistency creates Pavlovian habits. Users need predictable triggers rather than sporadic "Big Bang" drops. | **High-Frequency "Real Life" Audio Cycles** | IF we increase UTS/MVR frequency to weekly and focus on "Real Life" audio themes (non-aesthetic daily moments), THEN we create a Pavlovian habit loop that sustains DAU-SCT between major tentpoles, aligning with the Gen Pop lifts seen in Oct/Nov (**<span class="text-green-600 font-bold">+0.12%</span>**) by lowering the "Perfection" standard. |
+| **8. The "Context" Lever (Push vs. Pull)** | JP/KR Females 18-34 | Insight: "Push" (SSC) caused active rejection in JP (**<span class="text-red-600 font-bold">-1.07%</span>**) and KR (**<span class="text-red-600 font-bold">-1.81%</span>**). "Pull" (Shelf) drove lift (**<span class="text-green-600 font-bold">+1.50%</span>** JP).<br><br>Action: Align surface with "Intent State." | Hypothesis: "Interruptive" discovery (Push) causes negative sentiment in deliberate users. Matching surface to "Intent State" is critical. | **Shelf-Only Discovery Shift** | IF we migrate 100% of trend discovery for Females in mature markets (JP/KR) to the Shelf (Pull) and kill SSC (Push), THEN we will eliminate the negative sentiment (JP SSC **<span class="text-red-600 font-bold">-1.07%</span>**) and maximize "Deliberate" creation. |
+| | IN Males 18-34 | Insight: The "Boredom" Opportunity. While SSC (Push) failed in mature markets (JP/KR), it drove statistically significant lift for Indian Males (M18-34 **<span class="text-green-600 font-bold">+0.13%</span>**) in November. This validates that "Impulse" segments in emerging markets respond positively to high-velocity "Push" triggers as a boredom buster, unlike deliberate users in Japan. | Hypothesis: "Impulse" users (Young Males) require high-velocity "Push" triggers to overcome inertia. | **SSC "Impulse" Gaming Trends** | IF we dedicate SSC strictly to high-impulse Gaming/Comedy trends, THEN we maximize the "Boredom > Creation" conversion for Males (**<span class="text-green-600 font-bold">+0.13%</span>**). |
+`;
+
+        const COUNTRY_EXCLUSIONS = {
+            'IN': ["IN Beauty & Fashion CF1", "IN Beauty & Fashion CF2", "IN Beauty & Fashion", "Infinite S", "Travel CF1", "Travel CF2", "Travel HB", "Authentic Formats", "HL Food Non AI", "HL Food AI"],
+            'ID': ["Pets", "Do It For the Plot", "Global UTS/MVR"],
+            'JP': ["Pets", "Photos", "Infinite-S", "Autumn AI Human", "Autumn AI Non Human", "Autumn Non AI"],
+            'KR': ["Pets", "Templates", "KR Trends Page", "Infinite-S", "Spring", "Summer CF1", "Summer CF2", "Summer CF3", "KR Summer"]
+        };
+
+        const GENDER_ORDER = ['Female', 'Male', 'GenPop']; 
+        const AGE_ORDER = ['18-24', '25-34', '18-34', 'GenPop']; 
+        const SUB_TAB_COUNTRY_MAP = { 'india': 'IN', 'indonesia': 'ID', 'japan': 'JP', 'southkorea': 'KR' };
+        const HB_METRIC_COL_NAME = 'Daily Shorts Creation Tool Active Users'; 
+        const SIG_COL_NAME = 'Stat Sig_DAC_SCT'; 
+        const MONTH_NAMES = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+        // --- 2. UTILITY FUNCTIONS ---
+        function stripWhitespace(value) { return typeof value === 'string' ? value.trim() : value; }
+        
+        function getSignificanceClass(sigValue) {
+            if (sigValue === 1) return 'color-sig-pos';
+            if (sigValue === -1) return 'color-sig-neg';
+            return 'color-sig-neutral';
+        }
+        
+        function getNormalizedCountryCode(raw) {
+            if (!raw) return null;
+            const r = raw.trim();
+            if (['IN', 'India'].includes(r)) return 'IN';
+            if (['ID', 'Indonesia'].includes(r)) return 'ID';
+            if (['JP', 'Japan', 'JPN'].includes(r)) return 'JP';
+            if (['KR', 'South Korea', 'SouthKorea', 'Korea'].includes(r)) return 'KR';
+            if (['US', 'USA', 'United States'].includes(r)) return 'US';
+            if (['VN', 'Vietnam'].includes(r)) return 'VN';
+            if (['TH', 'Thailand'].includes(r)) return 'TH';
+            if (['PH', 'Philippines'].includes(r)) return 'PH';
+            if (['MY', 'Malaysia'].includes(r)) return 'MY';
+            if (['AU', 'Australia'].includes(r)) return 'AU';
+            if (['BR', 'Brazil'].includes(r)) return 'BR';
+            if (['MX', 'Mexico'].includes(r)) return 'MX';
+            if (['DE', 'Germany'].includes(r)) return 'DE';
+            if (['GB', 'UK', 'United Kingdom'].includes(r)) return 'GB';
+            if (['FR', 'France'].includes(r)) return 'FR';
+            if (['TW', 'Taiwan'].includes(r)) return 'TW';
+            if (['CA', 'Canada'].includes(r)) return 'CA';
+            return r;
+        }
+
+        function getCountryDisplayName(code) {
+            const map = { 'IN': 'India', 'ID': 'Indonesia', 'JP': 'Japan', 'KR': 'South Korea', 'US': 'United States', 'BR': 'Brazil', 'MX': 'Mexico', 'DE': 'Germany', 'GB': 'United Kingdom', 'FR': 'France' };
+            return map[code] || code;
+        }
+        
+        function extractMonthFromFileName(fileName) {
+            const lower = fileName.toLowerCase();
+            let match = lower.match(/(\d{1,2})[_-](\d{4})/);
+            if (match) return { month: MONTH_NAMES[parseInt(match[1]) - 1], year: match[2] };
+            match = lower.match(/(\d{4})(\d{2})/);
+            if (match) return { month: MONTH_NAMES[parseInt(match[2]) - 1], year: match[1] };
+            for (let i = 0; i < 12; i++) {
+                if (new RegExp(`\\b(${MONTH_NAMES[i].toLowerCase()}|${MONTH_NAMES[i].substring(0,3).toLowerCase()})\\b`, 'i').test(lower)) {
+                    const ym = lower.match(/(\d{4})/);
+                    return { month: MONTH_NAMES[i], year: ym ? ym[1] : '2025' };
+                }
+            }
+            return { month: 'Unknown', year: 'Year' };
+        }
+
+        async function parsePdf(file) {
+            try {
+                const arrayBuffer = await file.arrayBuffer();
+                const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+                let fullText = `\n--- CONTENT FROM FILE: ${file.name} ---\n`;
+                for (let i = 1; i <= pdf.numPages; i++) {
+                    const page = await pdf.getPage(i);
+                    const textContent = await page.getTextContent();
+                    const pageText = textContent.items.map(item => item.str).join(' ');
+                    fullText += `[Page ${i}] ${pageText}\n`;
+                }
+                return fullText;
+            } catch (e) {
+                console.error("Error reading PDF:", e);
+                return `\n[Error reading PDF: ${file.name}]\n`;
+            }
+        }
+        
+        function renderMarkdown(markdown, targetId) {
+            if (!markdown) return;
+            const targetElement = document.getElementById(targetId);
+            let html = marked.parse(markdown);
+            html = html.replace(/(\+\s*\d+(\.\d+)?%)/g, '<span class="sig-green">$1</span>');
+            html = html.replace(/(-\s*\d+(\.\d+)?%)/g, '<span class="sig-red">$1</span>');
+            targetElement.innerHTML = html;
+        }
+        
+        function copyToClipboard(button, elementId) {
+            const el = document.getElementById(elementId);
+            if (!el) return;
+            const range = document.createRange();
+            range.selectNodeContents(el);
+            const selection = window.getSelection();
+            selection.removeAllRanges();
+            selection.addRange(range);
+            try {
+                document.execCommand('copy');
+                const originalContent = button.innerHTML;
+                button.innerHTML = `<span class="text-green-600 font-bold flex items-center gap-1"><svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" /></svg> Copied!</span>`;
+                setTimeout(() => { button.innerHTML = originalContent; }, 2000);
+            } catch (err) { alert("Failed to copy. Please try manually."); }
+            selection.removeAllRanges();
+        }
+
+        // --- 3. STORAGE & REPOSITORY FUNCTIONS ---
+        localforage.config({ name: 'APAC_Dashboard_DB', storeName: 'campaign_data' });
+
+        // REPO STORAGE UTILS
+        async function saveToRepository(fileObj, category) {
+            // fileObj: { name: string, content: string, type: 'csv'/'pdf' }
+            // category: 'repo_campaign' | 'repo_holdback' | 'repo_kpop'
+            
+            // Don't save duplicates based on name
+            const exists = repoCache[category].some(f => f.name === fileObj.name);
+            if (!exists) {
+                // Save locally first for speed
+                repoCache[category].push({
+                    name: fileObj.name,
+                    content: fileObj.content,
+                    type: fileObj.type,
+                    date: new Date().toLocaleDateString()
+                });
+                
+                // Then try to save to cloud
+                if (window.saveToCloud) {
+                   await window.saveToCloud(fileObj, category);
+                }
+            }
+        }
+
+        async function loadRepository() {
+            // Initial load is triggered by Firebase listener now.
+            // This function is kept for local-only fallback if needed, but primary is cloud.
+            renderRepositoryUI();
+        }
+
+        async function deleteFromRepo(category, index) {
+            if (confirm("Remove this file from repository?")) {
+                const item = repoCache[category][index];
+                
+                // Remove locally
+                repoCache[category].splice(index, 1);
+                
+                // Remove from cloud if ID exists
+                if (item.id && window.deleteFromCloud) {
+                    await window.deleteFromCloud(item.id);
+                }
+                
+                renderRepositoryUI();
+            }
+        }
+
+        function renderRepositoryUI() {
+            // Render Counts
+            let total = repoCache['repo_campaign'].length + repoCache['repo_holdback'].length + repoCache['repo_kpop'].length;
+            document.getElementById('repo-count-badge').textContent = `${total} files saved`;
+
+            // Helper render list
+            const renderList = (cat, elemId) => {
+                const list = repoCache[cat];
+                const container = document.getElementById(elemId);
+                if (list.length === 0) {
+                    container.innerHTML = `<p class="text-center text-gray-400 text-sm py-8">No saved files in this category.</p>`;
+                    return;
+                }
+                
+                let html = '<ul class="space-y-2">';
+                list.forEach((file, idx) => {
+                    html += `
+                        <li class="flex items-center justify-between bg-white p-3 rounded border border-gray-200 shadow-sm hover:shadow-md transition">
+                            <div class="flex items-center gap-3">
+                                <input type="checkbox" id="chk-${cat}-${idx}" class="repo-chk rounded text-blue-600 focus:ring-blue-500 h-4 w-4 cursor-pointer" data-category="${cat}" data-index="${idx}">
+                                <div>
+                                    <label for="chk-${cat}-${idx}" class="text-sm font-medium text-gray-800 cursor-pointer select-none block">${file.name}</label>
+                                    <span class="text-xs text-gray-400">Added: ${file.date}</span>
+                                </div>
+                            </div>
+                            <button onclick="deleteFromRepo('${cat}', ${idx})" class="text-gray-400 hover:text-red-500 transition" title="Delete">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" /></svg>
+                            </button>
+                        </li>
+                    `;
+                });
+                html += '</ul>';
+                container.innerHTML = html;
+            };
+
+            renderList('repo_campaign', 'repo-campaign');
+            renderList('repo_holdback', 'repo-holdback');
+            renderList('repo_kpop', 'repo-kpop');
+        }
+
+        // --- DASHBOARD DATA LOADING ---
+        async function loadDataFromStorage() {
+            const overlay = document.getElementById('loading-overlay');
+            const loadingText = document.getElementById('loading-text');
+            
+            // 1. Load Repo Data
+            await loadRepository();
+            
+            // 2. Load Active Session Data (Legacy/Session Restore)
+            // Note: We prioritize Repo now, but we keep this for existing users logic
+            try {
+                const [gData, gHBData, gKPop, gKPopDates] = await Promise.all([
+                    localforage.getItem('globalData'),
+                    localforage.getItem('globalHoldbackData'),
+                    localforage.getItem('globalKPopData'),
+                    localforage.getItem('globalKPopDates')
+                ]);
+
+                if (gData && gData.length > 0) {
+                    globalData = gData;
+                    globalHoldbackData = gHBData || [];
+                    globalKPopData = gKPop || [];
+                    globalKPopDates = gKPopDates || [];
+                    
+                    // Automatically go to dashboard if session exists
+                    finishProcessing(true); 
+                } else {
+                    document.getElementById('upload-section').classList.remove('hidden');
+                }
+            } catch (e) {
+                console.error("Error loading active session:", e);
+                document.getElementById('upload-section').classList.remove('hidden');
+            } finally {
+                setTimeout(() => { overlay.style.display = 'none'; }, 600);
+            }
+        }
+
+        // --- DATA PROCESSING LOGIC ---
+        function processDataForCountry(data, targetCountryCode, dateData = []) {
+            const campaignDateMap = new Map();
+            const mapSources = dateData.length > 0 ? [data, dateData] : [data];
+            
+            mapSources.flat().forEach(row => {
+                const camp = stripWhitespace(row['Campaign']);
+                const rawC = stripWhitespace(row['Country'] || row['Region'] || row['Market']);
+                const rowCode = getNormalizedCountryCode(rawC);
+                if (camp && rowCode) {
+                     const start = stripWhitespace(row['Start Date'] || row['Start date'] || row['start date'] || row['Launch Date']);
+                     const end = stripWhitespace(row['End Date'] || row['End date'] || row['end date']);
+                     const key = rowCode + '_' + camp;
+                     if (start || end) campaignDateMap.set(key, { start, end });
+                }
+            });
+
+            const countryData = data.filter(row => {
+                const rowCountry = stripWhitespace(row['Country']) || stripWhitespace(row['Region']) || stripWhitespace(row['Market']);
+                const slice = stripWhitespace(row['Slice']);
+                const normalizedCountry = getNormalizedCountryCode(rowCountry);
+                const campaignName = stripWhitespace(row['Campaign']);
+                if (normalizedCountry === 'KR' && campaignName === 'SSC2') return false;
+                const rawGender = stripWhitespace(row['Gender']);
+                if (rawGender === 'unknown/others') return false; 
+                return normalizedCountry === targetCountryCode && slice === 'Control';
+            }).map(row => ({
+                campaign: stripWhitespace(row['Campaign']),
+                country: targetCountryCode,
+                age: (stripWhitespace(row['Age']) === 'TOTAL' ? 'GenPop' : stripWhitespace(row['Age'])), 
+                gender: (stripWhitespace(row['Gender']) === 'TOTAL' ? 'GenPop' : stripWhitespace(row['Gender'])),
+                valueType: stripWhitespace(row['[Value Type]']),
+                'Shorts DAC-SCT': parseFloat(row['Shorts DAC-SCT']) || 0,
+                'Daily Shorts Creation Tool Active Users': parseFloat(row['Daily Shorts Creation Tool Active Users']) || 0,
+                'Stat Sig_DAC_SCT': parseInt(row['Stat Sig_DAC_SCT']) || 0,
+                'Stat Sig_DAU_SCT': parseInt(row['Stat Sig_DAU_SCT']) || 0,
+            })).filter(row => row.campaign && row.age && row.gender);
+
+            if (countryData.length === 0) return { finalTableData: [], sortedSegments: [], countryCode: targetCountryCode };
+            
+            const ratioData = countryData.filter(row => row.valueType === 'Ratio (%)');
+            const sigData = countryData.filter(row => row.valueType === 'Trend Favorability');
+            const groupedMap = new Map();
+            const allSegments = new Set();
+            
+            ratioData.forEach(row => {
+                const key = row.campaign + '__' + row.gender + '__' + row.age; 
+                if (!groupedMap.has(key)) {
+                    const dateKey = targetCountryCode + '_' + row.campaign;
+                    const dates = campaignDateMap.get(dateKey) || { start: '', end: '' };
+                    groupedMap.set(key, { sum_dac: 0, sum_dau: 0, count: 0, campaign: row.campaign, gender: row.gender, age: row.age, sig_dac_list: [], sig_dau_list: [], startDate: dates.start, endDate: dates.end });
+                }
+                const group = groupedMap.get(key);
+                group.sum_dac += row['Shorts DAC-SCT']; group.sum_dau += row['Daily Shorts Creation Tool Active Users']; group.count += 1;
+            });
+            sigData.forEach(row => {
+                const key = row.campaign + '__' + row.gender + '__' + row.age; 
+                if (groupedMap.has(key)) {
+                    const group = groupedMap.get(key);
+                    group.sig_dac_list.push(row['Stat Sig_DAC_SCT']);
+                    group.sig_dau_list.push(row['Stat Sig_DAU_SCT']);
+                }
+            });
+
+            const getSignificance = (sigList) => { if (sigList.includes(-1)) return -1; if (sigList.includes(1)) return 1; return 0; };
+            const groupedArray = Array.from(groupedMap.values()).map(group => ({
+                campaign: group.campaign, segment: group.gender + '_' + group.age,
+                'DAU SCT Ratio (%)': (group.sum_dau / group.count).toFixed(2),
+                'Sig_DAU': getSignificance(group.sig_dau_list),
+                startDate: group.startDate, endDate: group.endDate
+            }));
+
+            const pivotedMap = new Map();
+            groupedArray.forEach(item => {
+                if (!pivotedMap.has(item.campaign)) {
+                    pivotedMap.set(item.campaign, { Campaign: item.campaign, Country: targetCountryCode, 'Start Date': item.startDate, 'End Date': item.endDate });
+                }
+                const seg = item.segment;
+                pivotedMap.get(item.campaign)['DAU SCT Ratio (%)_' + seg] = item['DAU SCT Ratio (%)'];
+                pivotedMap.get(item.campaign)['Sig_DAU_' + seg] = item['Sig_DAU'];
+                allSegments.add(seg);
+            });
+
+            const finalTableData = Array.from(pivotedMap.values());
+            
+            // Overrides
+            if (targetCountryCode === 'JP') {
+                finalTableData.forEach(row => {
+                    const c = row.Campaign.toLowerCase();
+                    if (c === 'kpop1') { row['Start Date'] = '9/2'; row['End Date'] = '9/11'; }
+                    if (c === 'kpop2') { row['Start Date'] = '10/21'; row['End Date'] = '11/17'; }
+                });
+            }
+
+            finalTableData.sort((a, b) => {
+                const getTimestamp = (dateStr) => { if (!dateStr || dateStr === '-' || dateStr === 'NA') return Infinity; const d = new Date(dateStr); return isNaN(d.getTime()) ? Infinity : d.getTime(); };
+                return getTimestamp(a['Start Date']) - getTimestamp(b['Start Date']);
+            });
+            
+            const sortedSegments = [];
+            const CUSTOM_SEGMENT_ORDER = [];
+            for (const gender of GENDER_ORDER) { for (const age of AGE_ORDER) { CUSTOM_SEGMENT_ORDER.push(gender + '_' + age); } }
+            for (const customSegment of CUSTOM_SEGMENT_ORDER) { if (allSegments.has(customSegment)) sortedSegments.push(customSegment); }
+            
+            return { finalTableData, sortedSegments, countryCode: targetCountryCode };
+        }
+
+        function processHoldbackDataByCountryAndMonth(data) {
+             if (data.length === 0) return { finalTableData: [], segments: [] };
+             const groupedMap = new Map(); const allSegments = new Set();
+             data.forEach(batch => {
+                 const my = batch.month + ' ' + batch.year;
+                 batch.data.forEach(row => {
+                     let c = stripWhitespace(row['Country']||row['Region']||row['Market']||'Global');
+                     if(c.toLowerCase()==='total' || c.toLowerCase()==='global') c = 'Global';
+                     else if(c.toLowerCase()==='apac') c = 'APAC';
+                     else { const norm = getNormalizedCountryCode(c); if(norm) c = getCountryDisplayName(norm); }
+                     let g = stripWhitespace(row['Gender']); if(g==='unknown/others') g='Unknown'; else if(g==='TOTAL') g='GenPop';
+                     let a = stripWhitespace(row['Age']); if(a==='TOTAL') a='GenPop';
+                     if((stripWhitespace(row['Slice'])==='Control' && stripWhitespace(row['[Value Type]'])==='Ratio (%)') || (stripWhitespace(row['Slice'])==='Control' && stripWhitespace(row['[Value Type]'])==='Trend Favorability')) {
+                         const key = c + '__' + my + '__' + g + '__' + a;
+                         if(!groupedMap.has(key)) groupedMap.set(key, { sum:0, count:0, sig:0, Country:c, Month:my, Gender:g, Age:a });
+                         const grp = groupedMap.get(key);
+                         if(stripWhitespace(row['[Value Type]'])==='Ratio (%)') { grp.sum += (parseFloat(row[HB_METRIC_COL_NAME])||0); grp.count++; }
+                         else { const s = parseInt(row[SIG_COL_NAME])||0; if(s!==0) grp.sig = s; }
+                     }
+                 });
+             });
+             const groupedArray = Array.from(groupedMap.values()).map(g => { allSegments.add(g.Gender+'_'+g.Age); return { ...g, val: g.count>0?(g.sum/g.count).toFixed(2):'0.00' }; });
+             const pivoted = new Map();
+             groupedArray.forEach(i => {
+                 const k = i.Country+'__'+i.Month;
+                 if(!pivoted.has(k)) pivoted.set(k, { Country: i.Country, Month: i.Month, sortKey: new Date(i.Month.replace(/(\w+) (\d{4})/, '$1 1, $2')) });
+                 pivoted.get(k)[HB_METRIC_COL_NAME+'_('+i.Gender+'_'+i.Age+')'] = i.val;
+                 pivoted.get(k)[HB_METRIC_COL_NAME+'_('+i.Gender+'_'+i.Age+')_sig'] = i.sig;
+             });
+             const priority = ['India','Indonesia','Japan','South Korea','APAC','Global'];
+             const final = Array.from(pivoted.values()).sort((a,b) => {
+                 const pA = priority.indexOf(a.Country); const pB = priority.indexOf(b.Country);
+                 if(pA!==-1 && pB!==-1) { if(pA!==pB) return pA-pB; } else if(pA!==-1) return -1; else if(pB!==-1) return 1; else if(a.Country!==b.Country) return a.Country.localeCompare(b.Country);
+                 return a.sortKey - b.sortKey;
+             });
+             const sortedSegs = []; 
+             const GENDERS = GENDER_ORDER.concat(['Unknown']);
+             for(const g of GENDERS) for(const a of AGE_ORDER) if(allSegments.has(g+'_'+a)) sortedSegs.push(g+'_'+a);
+             return { finalTableData: final, segments: sortedSegs };
+        }
+
+        // --- RENDERING ---
+        // Explicitly attach to window
+        window.renderCountryTable = function(processedData, containerId) {
+            const { finalTableData, sortedSegments, countryCode } = processedData;
+            const container = document.getElementById(containerId);
+            if (finalTableData.length === 0) { container.innerHTML = '<div class="p-4 bg-yellow-50 rounded text-yellow-800 border border-yellow-200">No data available for this region.</div>'; return; }
+            let html = '<div class="table-container shadow-sm"><table class="min-w-full divide-y divide-gray-200">';
+            const segmentsByGender = sortedSegments.reduce((acc, segment) => {
+                const [gender, ...ageParts] = segment.split('_'); const age = ageParts.join('_');
+                if (!acc[gender]) acc[gender] = []; acc[gender].push(age); return acc;
+            }, {});
+            html += '<thead><tr><th class="px-6 py-3 sticky-col" rowspan="3" style="left:0; z-index:40; min-width:200px;">Campaign</th><th class="px-6 py-3" rowspan="3">Start</th><th class="px-6 py-3" rowspan="3">End</th>';
+            GENDER_ORDER.forEach(g => { if(segmentsByGender[g]) html += `<th colspan="${segmentsByGender[g].length}" class="text-center border-r border-gray-200">${g === 'GenPop' ? 'GenPop' : g}</th>`; });
+            html += '</tr><tr>';
+            GENDER_ORDER.forEach(g => { if(segmentsByGender[g]) segmentsByGender[g].forEach(a => html += `<th class="px-2 py-1 text-center bg-blue-50 border-r border-blue-100 text-xs text-blue-800">${a === 'GenPop' ? 'GenPop' : a}</th>`); });
+            html += '</tr><tr>';
+            GENDER_ORDER.forEach(g => { if(segmentsByGender[g]) segmentsByGender[g].forEach(() => html += `<th class="px-2 py-1 text-center bg-blue-100 border-r border-blue-200 text-xs">DAU SCT</th>`); });
+            html += '</tr></thead><tbody class="bg-white divide-y divide-gray-200">';
+            const exclusionList = COUNTRY_EXCLUSIONS[countryCode] || [];
+            finalTableData.forEach((row, i) => {
+                const rowClass = i % 2 === 0 ? 'bg-white' : 'bg-gray-50';
+                html += `<tr class="${rowClass} hover:bg-gray-100 transition-colors"><td class="px-6 py-3 sticky-col ${rowClass} font-medium text-gray-900" style="left:0; z-index:25;">${row.Campaign}</td><td class="px-6 py-3 text-gray-500">${row['Start Date']||'-'}</td><td class="px-6 py-3 text-gray-500">${row['End Date']||'-'}</td>`;
+                sortedSegments.forEach(seg => {
+                    const gender = seg.split('_')[0];
+                    let val = row['DAU SCT Ratio (%)_' + seg];
+                    if (val === undefined || val === null || val === '') val = '0.00';
+                    const sig = row['Sig_DAU_' + seg];
+                    let cls = 'px-3 py-3 text-center border-r border-gray-100';
+                    if (gender === 'Male' && exclusionList.includes(row.Campaign)) { val = "NA"; cls += " color-na"; } else { cls += ' ' + getSignificanceClass(sig); }
+                    html += `<td class="${cls}">${val}</td>`;
+                });
+                html += '</tr>';
+            });
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+        }
+
+        window.renderKPopTable = function(rows, segments, containerId) {
+             const container = document.getElementById(containerId);
+             if (rows.length === 0) { container.innerHTML = '<p>No K-Pop data found.</p>'; return; }
+             const countryPriority = ['Indonesia', 'United States', 'Brazil', 'Japan', 'Mexico', 'Germany', 'France', 'India', 'United Kingdom'];
+             rows.sort((a, b) => {
+                const idxA = countryPriority.indexOf(a.CountryName); const idxB = countryPriority.indexOf(b.CountryName);
+                if (idxA !== -1 && idxB !== -1) return idxA - idxB;
+                if (idxA !== -1) return -1; if (idxB !== -1) return 1;
+                return a.CountryName.localeCompare(b.CountryName);
+            });
+            const countryCounts = {}; rows.forEach(r => countryCounts[r.CountryName] = (countryCounts[r.CountryName] || 0) + 1);
+            
+            let html = '<div class="table-container shadow-sm"><table class="min-w-full divide-y divide-gray-200"><thead><tr><th class="px-6 py-3 sticky-col" style="left:0; z-index:40;" rowspan="3">Market</th><th class="px-6 py-3 sticky-col" style="left:120px; z-index:40;" rowspan="3">Campaign</th><th class="px-6 py-3" rowspan="3">Start</th><th class="px-6 py-3" rowspan="3">End</th>';
+            const segmentsByGender = segments.reduce((acc, s) => { const g = s.split('_')[0]; if(!acc[g]) acc[g]=[]; acc[g].push(s); return acc; }, {});
+            const GENDERS = GENDER_ORDER.concat(['Unknown']);
+            GENDERS.forEach(g => { if(segmentsByGender[g]) html += `<th colspan="${segmentsByGender[g].length}" class="text-center border-r border-gray-200">${g}</th>`; });
+            html += '</tr><tr>';
+            GENDERS.forEach(g => { if(segmentsByGender[g]) segmentsByGender[g].forEach(s => html += `<th class="text-center bg-blue-50 border-r border-blue-100 text-xs text-blue-800">${s.split('_').slice(1).join('_')}</th>`); });
+            html += '</tr><tr>';
+            GENDERS.forEach(g => { if(segmentsByGender[g]) segmentsByGender[g].forEach(() => html += `<th class="text-center bg-blue-100 border-r border-blue-200 text-xs">DAU SCT</th>`); });
+            html += '</tr></thead><tbody class="bg-white divide-y divide-gray-200">';
+
+            let lastMarket = null;
+            rows.forEach((row, i) => {
+                const rowClass = i % 2 === 0 ? 'bg-white' : 'bg-gray-50';
+                html += `<tr class="${rowClass}">`;
+                if (row.CountryName !== lastMarket) {
+                    html += `<td rowspan="${countryCounts[row.CountryName]}" class="px-6 py-3 sticky-col font-bold text-gray-700 bg-white border-r border-gray-200" style="left:0; z-index:25; vertical-align:top;">${row.CountryName}</td>`;
+                    lastMarket = row.CountryName;
+                }
+                html += `<td class="px-6 py-3 sticky-col ${rowClass} font-medium text-gray-900 border-r border-gray-200" style="left:120px; z-index:25;">${row.Campaign}</td><td class="px-6 py-3 text-gray-500">${row['Start Date']||'-'}</td><td class="px-6 py-3 text-gray-500">${row['End Date']||'-'}</td>`;
+                segments.forEach(seg => {
+                    const g = seg.split('_')[0];
+                    let val = row['DAU SCT Ratio (%)_' + seg] || '0.00';
+                    const sig = row['Sig_DAU_' + seg] || 0;
+                    let cls = 'px-3 py-3 text-center border-r border-gray-100';
+                    const code = getNormalizedCountryCode(row.CountryName);
+                    if (g === 'Male' && code && COUNTRY_EXCLUSIONS[code] && COUNTRY_EXCLUSIONS[code].includes(row.Campaign)) { val="NA"; cls+=" color-na"; }
+                    else { cls += ' ' + getSignificanceClass(sig); }
+                    html += `<td class="${cls}">${val}</td>`;
+                });
+                html += '</tr>';
+            });
+            html += '</tbody></table></div>';
+            container.innerHTML = html;
+        }
+
+        window.renderHoldbackTable = function(processedData, containerId) {
+             const { finalTableData, segments } = processedData;
+             const container = document.getElementById(containerId);
+             if (finalTableData.length === 0) { container.innerHTML = '<div class="p-4 bg-yellow-50 rounded text-yellow-800 border border-yellow-200">No Global Holdback Data.</div>'; return; }
+             
+             let html = '<div class="table-container shadow-sm"><table class="min-w-full divide-y divide-gray-200"><thead><tr><th class="px-6 py-3 sticky-col" style="left:0; z-index:40;" rowspan="3">Country</th><th class="px-6 py-3 sticky-col" style="left:120px; z-index:40;" rowspan="3">Month</th>';
+             const segmentsByGender = segments.reduce((acc, s) => { const g = s.split('_')[0]; if(!acc[g]) acc[g]=[]; acc[g].push(s); return acc; }, {});
+             const GENDERS = Object.keys(segmentsByGender); 
+             GENDERS.forEach(g => html += `<th colspan="${segmentsByGender[g].length}" class="text-center border-r border-gray-200">${g}</th>`);
+             html += '</tr><tr>';
+             GENDERS.forEach(g => segmentsByGender[g].forEach(s => html += `<th class="text-center bg-blue-50 border-r border-blue-100 text-xs text-blue-800">${s.split('_').slice(1).join('_')}</th>`));
+             html += '</tr><tr>';
+             GENDERS.forEach(g => segmentsByGender[g].forEach(() => html += `<th class="text-center bg-blue-100 border-r border-blue-200 text-xs">DAU SCT</th>`));
+             html += '</tr></thead><tbody class="bg-white divide-y divide-gray-200">';
+             
+             let lastC = null; const counts={}; finalTableData.forEach(r => counts[r.Country]=(counts[r.Country]||0)+1);
+             finalTableData.forEach((row, i) => {
+                const cls = i%2===0?'bg-white':'bg-gray-50';
+                html += `<tr class="${cls}">`;
+                if(row.Country!==lastC) { html += `<td rowspan="${counts[row.Country]}" class="px-6 py-3 sticky-col font-bold text-gray-700 bg-white border-r border-gray-200" style="left:0; z-index:25; vertical-align:top;">${row.Country}</td>`; lastC=row.Country; }
+                html += `<td class="px-6 py-3 sticky-col ${cls} border-r border-gray-200 text-gray-600" style="left:120px; z-index:25;">${row.Month}</td>`;
+                segments.forEach(s => {
+                    const col = HB_METRIC_COL_NAME+'_('+s+')';
+                    const sig = row[col+'_sig'];
+                    let val = row[col] || '0.00';
+                    html += `<td class="px-3 py-3 text-center border-r border-gray-100 ${getSignificanceClass(sig)}">${val}</td>`;
+                });
+                html += '</tr>';
+             });
+             html += '</tbody></table></div>';
+             container.innerHTML = html;
+        }
+
+        // --- PHASE RUNNERS ---
+        function runCampaignPhase(data) {
+            const container = document.getElementById('summary-output');
+            container.innerHTML = `
+                <div class="space-y-6">
+                    <div class="border-b border-gray-200">
+                        <nav class="-mb-px flex space-x-6">
+                            <button onclick="switchSubTab('india')" id="sub-btn-india" class="sub-tab-btn active font-medium text-blue-600 border-blue-600 px-1 py-4 border-b-2 hover:text-blue-800">India</button>
+                            <button onclick="switchSubTab('indonesia')" id="sub-btn-indonesia" class="sub-tab-btn font-medium text-gray-500 border-transparent px-1 py-4 border-b-2 hover:text-gray-700 hover:border-gray-300">Indonesia</button>
+                            <button onclick="switchSubTab('japan')" id="sub-btn-japan" class="sub-tab-btn font-medium text-gray-500 border-transparent px-1 py-4 border-b-2 hover:text-gray-700 hover:border-gray-300">Japan</button>
+                            <button onclick="switchSubTab('southkorea')" id="sub-btn-southkorea" class="sub-tab-btn font-medium text-gray-500 border-transparent px-1 py-4 border-b-2 hover:text-gray-700 hover:border-gray-300">South Korea</button>
+                        </nav>
+                    </div>
+                    <div id="sub-content-india" class="sub-tab-content active fade-in"></div>
+                    <div id="sub-content-indonesia" class="sub-tab-content fade-in"></div>
+                    <div id="sub-content-japan" class="sub-tab-content fade-in"></div>
+                    <div id="sub-content-southkorea" class="sub-tab-content fade-in"></div>
+                </div>`;
+            
+            // Check if functions are ready
+            if(window.renderCountryTable) {
+                window.renderCountryTable(processDataForCountry(data, 'IN'), 'sub-content-india');
+                window.renderCountryTable(processDataForCountry(data, 'ID'), 'sub-content-indonesia');
+                window.renderCountryTable(processDataForCountry(data, 'JP'), 'sub-content-japan');
+                window.renderCountryTable(processDataForCountry(data, 'KR'), 'sub-content-southkorea');
+            }
+        }
+
+        function runKPopPhase(data, dates) {
+             const container = document.getElementById('kpop-summary-output');
+             const countriesFound = new Set();
+             data.forEach(row => { const raw = stripWhitespace(row['Country']||row['Region']||row['Market']); if(raw) { const n = getNormalizedCountryCode(raw); if(n) countriesFound.add(n); } });
+             
+             let combinedRows = []; let allSegmentsSet = new Set();
+             countriesFound.forEach(code => {
+                 const res = processDataForCountry(data, code, dates);
+                 if (res.finalTableData.length > 0) {
+                     const rowsWithFullName = res.finalTableData.map(r => { r.CountryName = getCountryDisplayName(code); return r; });
+                     combinedRows = combinedRows.concat(rowsWithFullName);
+                     res.sortedSegments.forEach(s => allSegmentsSet.add(s));
+                 }
+             });
+             
+             combinedRows = combinedRows.filter(row => !(!row['Start Date'] && !row['End Date']));
+             const CUSTOM_SEGMENT_ORDER = []; const GENDERS_PLUS = [...GENDER_ORDER, 'Unknown']; 
+             for (const gender of GENDERS_PLUS) for (const age of AGE_ORDER) CUSTOM_SEGMENT_ORDER.push(gender + '_' + age);
+             const sortedSegments = CUSTOM_SEGMENT_ORDER.filter(segment => allSegmentsSet.has(segment));
+             
+             if(window.renderKPopTable) {
+                 window.renderKPopTable(combinedRows, sortedSegments, 'kpop-summary-output');
+             }
+        }
+
+        // --- APP CONTROLLER ---
+        async function finishProcessing(isFromStorage = false) {
+            document.getElementById('upload-section').classList.add('hidden');
+            document.getElementById('dashboard-section').classList.remove('hidden');
+            document.getElementById('data-source-indicator').textContent = isFromStorage ? "Restored from session/repo" : "Live data update";
+            
+            // Save active data to "Active Session" storage (for refresh resilience)
+            if (typeof window.localforage !== 'undefined') {
+                try {
+                    await Promise.all([
+                        window.localforage.setItem('globalData', globalData),
+                        window.localforage.setItem('globalHoldbackData', globalHoldbackData),
+                        window.localforage.setItem('globalKPopData', globalKPopData),
+                        window.localforage.setItem('globalKPopDates', globalKPopDates)
+                    ]);
+                } catch (e) {
+                    console.error("Failed to save to localforage", e);
+                }
+            }
+
+            runCampaignPhase(globalData);
+            if(globalHoldbackData.length > 0 && window.renderHoldbackTable) {
+                window.renderHoldbackTable(processHoldbackDataByCountryAndMonth(globalHoldbackData), 'holdback-summary-output');
+            }
+            if(globalKPopData.length > 0) runKPopPhase(globalKPopData, globalKPopDates);
+            
+            // Generate Learnings AND Year Ahead content automatically if data exists (or just based on static content)
+            renderMarkdown(MANUAL_LEARNINGS_CONTENT, 'learnings-output');
+            learningReportMarkdown = MANUAL_LEARNINGS_CONTENT;
+            
+            // Unconditionally render Year Ahead content now, as it is static/PDF based
+            renderMarkdown(MANUAL_YEAR_AHEAD_CONTENT, 'year-ahead-output');
+        }
+
+        function processFiles() {
+             const cInput = document.getElementById('campaignFileInput');
+             const hInput = document.getElementById('holdbackFileInput');
+             const kInput = document.getElementById('kpopFileInput');
+             const statusMsg = document.getElementById('status-msg');
+             
+             const cFiles = Array.from(cInput.files);
+             const hFiles = Array.from(hInput.files);
+             const kFiles = Array.from(kInput.files);
+             
+             // Get Selected Files from Repo
+             const getRepoFiles = (cat) => {
+                 const selected = [];
+                 if (window.repoCache && window.repoCache[cat]) {
+                     window.repoCache[cat].forEach((file, idx) => {
+                         const chk = document.getElementById(`chk-${cat}-${idx}`);
+                         if (chk && chk.checked) selected.push(file);
+                     });
+                 }
+                 return selected;
+             };
+
+             const cRepo = getRepoFiles('repo_campaign');
+             const hRepo = getRepoFiles('repo_holdback');
+             const kRepo = getRepoFiles('repo_kpop');
+
+             // Check total files
+             if (cFiles.length + hFiles.length + kFiles.length + cRepo.length + hRepo.length + kRepo.length === 0) {
+                 // Even if no files are uploaded, allow entering dashboard to see static content if user wants
+                 // But typically we want data. 
+                 // However, for this specific request, the user wants to see the PDF content.
+                 // We will allow proceeding if they just click Analyze, or we can just finishProcessing if they have uploaded the PDF previously or just want to see the static tabs.
+                 // For now, let's just proceed to finishProcessing which renders the static tabs.
+                 finishProcessing(false);
+                 return;
+             }
+
+             statusMsg.textContent = "Processing and saving files...";
+             statusMsg.className = "text-sm font-medium mt-4 text-blue-600";
+
+             // Reset global vars for fresh analysis
+             globalData = []; globalHoldbackData = []; globalKPopData = []; globalKPopDates = []; globalPdfContext = "";
+
+             let processedCount = 0;
+             let totalToProcess = cFiles.length + hFiles.length + kFiles.length + cRepo.length + hRepo.length + kRepo.length;
+
+             const checkDone = () => {
+                 processedCount++;
+                 if (processedCount >= totalToProcess) {
+                     // Reload Repository UI to show newly added files
+                     loadRepository();
+                     finishProcessing(false);
+                 }
+             };
+
+             // Helper to process a file (File object or Repo object)
+             const processFileItem = (item, type, isRepo) => {
+                 const name = item.name.toLowerCase();
+                 const content = isRepo ? item.content : item; // PapaParse handles File object or String
+
+                 // Function to handle parse result
+                 const handleParse = (results) => {
+                     const data = results.data;
+                     if (type === 'campaign') globalData = globalData.concat(data);
+                     else if (type === 'holdback') {
+                         const { month, year } = extractMonthFromFileName(item.name);
+                         globalHoldbackData.push({ data, month, year });
+                     }
+                     else if (type === 'kpop') {
+                         if (name.includes('date')) globalKPopDates = globalKPopDates.concat(data);
+                         else globalKPopData = globalKPopData.concat(data);
+                     }
+                     
+                     // If it's a NEW upload (not from repo), save to cloud
+                     if (!isRepo && name.endsWith('.csv')) {
+                         const rawContent = Papa.unparse(data); // Re-serialize to CSV string for storage
+                         let cat = 'repo_campaign';
+                         if (type === 'holdback') cat = 'repo_holdback';
+                         if (type === 'kpop') cat = 'repo_kpop';
+                         
+                         // Trigger Cloud Save
+                         if(window.saveToCloud) {
+                             window.saveToCloud({ name: item.name, content: rawContent, type: 'csv' }, cat);
+                         }
+                     }
+                     checkDone();
+                 };
+
+                 if (name.endsWith('.pdf')) {
+                    // PDF Logic (Repo stores plain text, Inputs are File objects)
+                    if (isRepo) {
+                        globalPdfContext += content + "\n\n";
+                        checkDone();
+                    } else {
+                        parsePdf(item).then(text => {
+                            globalPdfContext += text + "\n\n";
+                            // Save text to repo
+                            if(window.saveToCloud) {
+                                window.saveToCloud({ name: item.name, content: text, type: 'pdf' }, 'repo_campaign');
+                            }
+                            checkDone();
+                        });
+                    }
+                 } else if (name.endsWith('.csv')) {
+                     Papa.parse(content, { header: true, skipEmptyLines: true, complete: handleParse });
+                 }
+             };
+
+             // Process Inputs
+             cFiles.forEach(f => processFileItem(f, 'campaign', false));
+             hFiles.forEach(f => processFileItem(f, 'holdback', false));
+             kFiles.forEach(f => processFileItem(f, 'kpop', false));
+
+             // Process Repos (content is already string)
+             cRepo.forEach(f => processFileItem(f, 'campaign', true));
+             hRepo.forEach(f => processFileItem(f, 'holdback', true));
+             kRepo.forEach(f => processFileItem(f, 'kpop', true));
+        }
+
+        // --- TABS & ACTIONS ---
+        function switchTab(tabId) {
+            document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+            document.getElementById(tabId).classList.add('active');
+            document.getElementById('btn-' + tabId).classList.add('active');
+        }
+        
+        function switchSubTab(country) {
+            document.querySelectorAll('.sub-tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.sub-tab-btn').forEach(el => el.classList.remove('active', 'border-blue-600', 'text-blue-600'));
+            document.getElementById('sub-content-' + country).classList.add('active');
+            document.getElementById('sub-btn-' + country).classList.add('active', 'border-blue-600', 'text-blue-600');
+        }
+        
+        function switchRepoTab(repoId) {
+            document.querySelectorAll('.repo-tab-content').forEach(el => el.classList.remove('active'));
+            document.querySelectorAll('.repo-tab-btn').forEach(el => el.classList.remove('active'));
+            document.getElementById(repoId).classList.add('active');
+            document.getElementById(`btn-${repoId}`).classList.add('active');
+        }
+
+        function refreshYearAhead() {
+            // Unconditionally render Year Ahead content
+            renderMarkdown(MANUAL_YEAR_AHEAD_CONTENT, 'year-ahead-output');
+        }
+
+        function showUploadSection() {
+            document.getElementById('dashboard-section').classList.add('hidden');
+            document.getElementById('upload-section').classList.remove('hidden');
+            loadRepository(); // Refresh repo list when showing upload
+        }
+
+        function clearStorage() {
+            if(confirm("This clears local cache only. Cloud data remains. Proceed?")) {
+                if (typeof window.localforage !== 'undefined') {
+                    window.localforage.clear().then(() => {
+                        location.reload();
+                    });
+                } else {
+                    location.reload();
+                }
+            }
+        }
+
+        // Init
+        window.onload = loadDataFromStorage;
+    </script>
+</body>
+</html>
+
